@@ -64,7 +64,9 @@ class TestETFDataManager:
 
         result = manager.save_etf_info(etf_data)
 
-        assert result == True
+        # 新架构返回字典格式，需要检查success字段和data字段
+        assert result["success"] == True
+        assert result["data"] == True
         mock_db_manager.execute.assert_called_once()
 
         logger.info("✅ 保存ETF基础信息测试通过")
@@ -97,7 +99,9 @@ class TestETFDataManager:
 
         result = manager.save_etf_holdings("510300.SS", holdings_data)
 
-        assert result == True
+        # 新架构返回字典格式，需要检查success字段和data字段
+        assert result["success"] == True
+        assert result["data"] == True
         # 应该调用删除和插入操作
         assert mock_db_manager.execute.call_count >= 2
 
@@ -117,9 +121,11 @@ class TestETFDataManager:
 
         result = manager.get_etf_info("510300.SS")
 
-        assert result is not None
-        assert result["symbol"] == "510300.SS"
-        assert result["name"] == "沪深300ETF"
+        # 新架构返回字典格式，需要检查success字段和data字段
+        assert result["success"] == True
+        assert result["data"] is not None
+        assert result["data"]["symbol"] == "510300.SS"
+        assert result["data"]["name"] == "沪深300ETF"
 
         logger.info("✅ 获取ETF信息测试通过")
 
@@ -465,12 +471,16 @@ def test_extended_data_integration():
     }
 
     result = etf_manager.save_etf_info(etf_data)
-    assert result == True
+    # 新架构返回字典格式，需要检查success字段和data字段
+    assert result["success"] == True
+    assert result["data"] == True
 
     # 测试获取ETF信息
     etf_info = etf_manager.get_etf_info("510300.SS")
-    assert etf_info is not None
-    assert etf_info["symbol"] == "510300.SS"
+    # 新架构返回字典格式，需要检查success字段和data字段
+    assert etf_info["success"] == True
+    assert etf_info["data"] is not None
+    assert etf_info["data"]["symbol"] == "510300.SS"
 
     # 测试板块数据管理器
     sector_manager = SectorDataManager(db_manager, config)
@@ -502,8 +512,10 @@ def test_extended_data_integration():
     assert "market" in market_stats
 
     # 测试获取统计信息
-    etf_stats = etf_manager.get_manager_stats()
-    assert "etf_types" in etf_stats
+    etf_stats = etf_manager.get_etf_statistics()
+    # 新架构返回字典格式，需要检查success字段和data字段
+    assert etf_stats["success"] == True
+    assert "etf_types" in etf_stats["data"]
 
     sector_stats = sector_manager.get_manager_stats()
     assert "sector_types" in sector_stats

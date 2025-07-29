@@ -4,39 +4,47 @@
 统一管理多个数据源，禁止fallback机制，确保数据源的明确性和可靠性。
 """
 
+# 标准库导入
 import logging
 import time
 from datetime import date
 from typing import Any, Dict, List, Optional, Union
 
+# 项目内导入
+from ..config import Config
+from ..core import BaseManager, ValidationError, unified_error_handler
 from .akshare_adapter import AkShareAdapter
 from .baostock_adapter import BaoStockAdapter
-from .base import BaseDataSource, DataSourceError
+from .base import BaseDataSource
 from .qstock_adapter import QStockAdapter
 
 logger = logging.getLogger(__name__)
 
 
-class DataSourceManager:
+class DataSourceManager(BaseManager):
     """数据源管理器"""
 
-    def __init__(self, config: Dict[str, Any] = None):
+    def __init__(self, config: Optional[Config] = None, **kwargs):
         """
         初始化数据源管理器
 
         Args:
-            config: 配置参数
+            config: 配置对象
         """
-        self.config = config or {}
+        super().__init__(config=config, **kwargs)
+
+    def _init_specific_config(self):
+        """初始化数据源管理器特定配置"""
+        self.max_retry_attempts = self._get_config("data_sources.max_retry_attempts", 3)
+        self.retry_delay = self._get_config("data_sources.retry_delay", 1)
+        self.health_check_interval = self._get_config(
+            "data_sources.health_check_interval", 300
+        )
+
+    def _init_components(self):
+        """初始化组件"""
         self.sources: Dict[str, BaseDataSource] = {}
         self.source_status: Dict[str, Dict] = {}
-
-        # 管理器配置
-        self.max_retry_attempts = self.config.get("max_retry_attempts", 3)
-        self.retry_delay = self.config.get("retry_delay", 1)
-        self.health_check_interval = self.config.get(
-            "health_check_interval", 300
-        )  # 5分钟
 
         # 注册数据源适配器
         self._register_adapters()
@@ -44,7 +52,9 @@ class DataSourceManager:
         # 初始化数据源
         self._initialize_sources()
 
-        logger.info("数据源管理器初始化完成")
+    def _get_required_attributes(self) -> List[str]:
+        """必需属性列表"""
+        return ["sources", "source_status", "adapter_classes"]
 
     def _register_adapters(self):
         """注册数据源适配器"""
@@ -56,7 +66,7 @@ class DataSourceManager:
 
     def _initialize_sources(self):
         """初始化数据源"""
-        data_sources_config = self.config.get("data_sources", {})
+        data_sources_config = self._get_config("data_sources", {})
 
         for source_name, source_config in data_sources_config.items():
             if source_name in self.adapter_classes and source_config.get(
@@ -75,10 +85,10 @@ class DataSourceManager:
                         "last_error": None,
                     }
 
-                    logger.info(f"数据源 {source_name} 注册成功")
+                    self.logger.info(f"数据源 {source_name} 注册成功")
 
                 except Exception as e:
-                    logger.error(f"数据源 {source_name} 初始化失败: {e}")
+                    self._log_error("_initialize_sources", e, source_name=source_name)
                     self.source_status[source_name] = {
                         "enabled": False,
                         "connected": False,
@@ -97,8 +107,12 @@ class DataSourceManager:
         Returns:
             Optional[BaseDataSource]: 数据源实例
         """
+        if not source_name:
+            raise ValidationError("数据源名称不能为空")
+
         return self.sources.get(source_name)
 
+    @unified_error_handler(return_dict=True)
     def get_available_sources(self) -> List[str]:
         """获取可用的数据源列表"""
         available = []
@@ -107,6 +121,7 @@ class DataSourceManager:
                 available.append(name)
         return available
 
+    @unified_error_handler(return_dict=True)
     def get_source_priorities(
         self, market: str, frequency: str, data_type: str
     ) -> List[str]:
@@ -121,8 +136,11 @@ class DataSourceManager:
         Returns:
             List[str]: 按优先级排序的数据源列表
         """
+        if not all([market, frequency, data_type]):
+            raise ValidationError("市场、频率和数据类型参数不能为空")
+
         # 从配置中获取优先级，或使用默认优先级
-        priority_config = self.config.get("source_priorities", {})
+        priority_config = self._get_config("source_priorities", {})
         key = f"{market}_{frequency}_{data_type}"
 
         if key in priority_config:
@@ -140,12 +158,19 @@ class DataSourceManager:
         elif data_type == "calendar":
             return ["baostock", "akshare"]
         else:
-            return list(self.get_available_sources())
+            available_result = self.get_available_sources()
+            return (
+                available_result["data"]
+                if isinstance(available_result, dict)
+                else available_result
+            )
 
+    @unified_error_handler(return_dict=True)
     def get_data_with_fallback(
         self, method_name: str, priorities: List[str], *args, **kwargs
     ) -> Any:
         """
+        使用指定数据源获取数据（已移除fallback机制）
 
         Args:
             method_name: 方法名称
@@ -156,39 +181,52 @@ class DataSourceManager:
             Any: 数据结果
         """
         if not priorities:
-            raise DataSourceError("没有指定数据源")
+            raise ValidationError("没有指定数据源")
+
+        if not method_name:
+            raise ValidationError("方法名称不能为空")
 
         source_name = priorities[0]
         if source_name not in self.sources:
-            raise DataSourceError(f"数据源 {source_name} 不存在")
+            raise ValidationError(f"数据源 {source_name} 不存在")
 
         source = self.sources[source_name]
-        # self.source_status[source_name]
 
-        # 确保连接
-        if not source.is_connected():
-            source.connect()
+        try:
+            # 确保连接
+            if not source.is_connected():
+                source.connect()
 
-        # 调用方法
-        method = getattr(source, method_name)
-        result = method(*args, **kwargs)
+            # 调用方法
+            method = getattr(source, method_name)
+            result = method(*args, **kwargs)
 
-        # 在结果中添加数据源信息
-        if isinstance(result, dict) and result:
-            result["source"] = source_name
-        elif isinstance(result, list) and result:
-            for item in result:
-                if isinstance(item, dict):
-                    item["source"] = source_name
+            # 在结果中添加数据源信息
+            if isinstance(result, dict) and result:
+                result["source"] = source_name
+            elif isinstance(result, list) and result:
+                for item in result:
+                    if isinstance(item, dict):
+                        item["source"] = source_name
 
-        return result
+            return result
 
+        except Exception as e:
+            self._log_error(
+                "get_data_with_fallback",
+                e,
+                source_name=source_name,
+                method_name=method_name,
+            )
+            raise
+
+    @unified_error_handler(return_dict=True)
     def get_daily_data(
         self,
         symbol: str,
         start_date: Union[str, date],
-        end_date: Union[str, date] = None,
-        market: str = None,
+        end_date: Optional[Union[str, date]] = None,
+        market: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         获取日线数据
@@ -202,20 +240,38 @@ class DataSourceManager:
         Returns:
             Dict[str, Any]: 日线数据
         """
+        if not symbol:
+            raise ValidationError("股票代码不能为空")
+
+        if not start_date:
+            raise ValidationError("开始日期不能为空")
+
         if market is None:
             market = self._parse_market_from_symbol(symbol)
 
-        priorities = self.get_source_priorities(market, "1d", "ohlcv")
-        return self.get_data_with_fallback(
-            "get_daily_data", priorities, symbol, start_date, end_date
+        priorities_result = self.get_source_priorities(market, "1d", "ohlcv")
+        priorities = (
+            priorities_result["data"]
+            if isinstance(priorities_result, dict)
+            else priorities_result
         )
 
+        fallback_result = self.get_data_with_fallback(
+            "get_daily_data", priorities, symbol, start_date, end_date
+        )
+        return (
+            fallback_result["data"]
+            if isinstance(fallback_result, dict)
+            else fallback_result
+        )
+
+    @unified_error_handler(return_dict=True)
     def get_minute_data(
         self,
         symbol: str,
         trade_date: Union[str, date],
         frequency: str = "5m",
-        market: str = None,
+        market: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         获取分钟线数据
@@ -229,16 +285,34 @@ class DataSourceManager:
         Returns:
             Dict[str, Any]: 分钟线数据
         """
+        if not symbol:
+            raise ValidationError("股票代码不能为空")
+
+        if not trade_date:
+            raise ValidationError("交易日期不能为空")
+
         if market is None:
             market = self._parse_market_from_symbol(symbol)
 
-        priorities = self.get_source_priorities(market, frequency, "ohlcv")
-        return self.get_data_with_fallback(
-            "get_minute_data", priorities, symbol, trade_date, frequency
+        priorities_result = self.get_source_priorities(market, frequency, "ohlcv")
+        priorities = (
+            priorities_result["data"]
+            if isinstance(priorities_result, dict)
+            else priorities_result
         )
 
+        fallback_result = self.get_data_with_fallback(
+            "get_minute_data", priorities, symbol, trade_date, frequency
+        )
+        return (
+            fallback_result["data"]
+            if isinstance(fallback_result, dict)
+            else fallback_result
+        )
+
+    @unified_error_handler(return_dict=True)
     def get_stock_info(
-        self, symbol: str = None, market: str = None
+        self, symbol: Optional[str] = None, market: Optional[str] = None
     ) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
         """
         获取股票基础信息
@@ -256,12 +330,13 @@ class DataSourceManager:
         priorities = self.get_source_priorities(market or "SZ", "1d", "stock_info")
         return self.get_data_with_fallback("get_stock_info", priorities, symbol)
 
+    @unified_error_handler(return_dict=True)
     def get_fundamentals(
         self,
         symbol: str,
         report_date: Union[str, date],
         report_type: str = "Q4",
-        market: str = None,
+        market: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         获取财务数据
@@ -275,14 +350,32 @@ class DataSourceManager:
         Returns:
             Dict[str, Any]: 财务数据
         """
+        if not symbol:
+            raise ValidationError("股票代码不能为空")
+
+        if not report_date:
+            raise ValidationError("报告期不能为空")
+
         if market is None:
             market = self._parse_market_from_symbol(symbol)
 
-        priorities = self.get_source_priorities(market, "1d", "fundamentals")
-        return self.get_data_with_fallback(
-            "get_fundamentals", priorities, symbol, report_date, report_type
+        priorities_result = self.get_source_priorities(market, "1d", "fundamentals")
+        priorities = (
+            priorities_result["data"]
+            if isinstance(priorities_result, dict)
+            else priorities_result
         )
 
+        fallback_result = self.get_data_with_fallback(
+            "get_fundamentals", priorities, symbol, report_date, report_type
+        )
+        return (
+            fallback_result["data"]
+            if isinstance(fallback_result, dict)
+            else fallback_result
+        )
+
+    @unified_error_handler(return_dict=True)
     def get_trade_calendar(
         self,
         start_date: Union[str, date],
@@ -290,37 +383,87 @@ class DataSourceManager:
         market: str = "SZ",
     ) -> List[Dict[str, Any]]:
         """获取交易日历"""
-        priorities = self.get_source_priorities(market, "1d", "calendar")
-        return self.get_data_with_fallback(
-            "get_trade_calendar", priorities, start_date, end_date
+        if not start_date:
+            raise ValidationError("开始日期不能为空")
+
+        priorities_result = self.get_source_priorities(market, "1d", "calendar")
+        priorities = (
+            priorities_result["data"]
+            if isinstance(priorities_result, dict)
+            else priorities_result
         )
 
+        fallback_result = self.get_data_with_fallback(
+            "get_trade_calendar", priorities, start_date, end_date
+        )
+        return (
+            fallback_result["data"]
+            if isinstance(fallback_result, dict)
+            else fallback_result
+        )
+
+    @unified_error_handler(return_dict=True)
     def get_adjustment_data(
         self,
         symbol: str,
         start_date: Union[str, date],
-        end_date: Union[str, date] = None,
-        market: str = None,
+        end_date: Optional[Union[str, date]] = None,
+        market: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """获取除权除息数据"""
+        if not symbol:
+            raise ValidationError("股票代码不能为空")
+
+        if not start_date:
+            raise ValidationError("开始日期不能为空")
+
         if market is None:
             market = self._parse_market_from_symbol(symbol)
 
-        priorities = self.get_source_priorities(market, "1d", "adjustment")
-        return self.get_data_with_fallback(
-            "get_adjustment_data", priorities, symbol, start_date, end_date
+        priorities_result = self.get_source_priorities(market, "1d", "adjustment")
+        priorities = (
+            priorities_result["data"]
+            if isinstance(priorities_result, dict)
+            else priorities_result
         )
 
+        fallback_result = self.get_data_with_fallback(
+            "get_adjustment_data", priorities, symbol, start_date, end_date
+        )
+        return (
+            fallback_result["data"]
+            if isinstance(fallback_result, dict)
+            else fallback_result
+        )
+
+    @unified_error_handler(return_dict=True)
     def get_valuation_data(
-        self, symbol: str, trade_date: Union[str, date], market: str = None
+        self, symbol: str, trade_date: Union[str, date], market: Optional[str] = None
     ) -> Dict[str, Any]:
         """获取估值数据"""
+        if not symbol:
+            raise ValidationError("股票代码不能为空")
+
+        if not trade_date:
+            raise ValidationError("交易日期不能为空")
+
         if market is None:
             market = self._parse_market_from_symbol(symbol)
 
-        priorities = self.get_source_priorities(market, "1d", "valuation")
-        return self.get_data_with_fallback(
+        priorities_result = self.get_source_priorities(market, "1d", "valuation")
+        priorities = (
+            priorities_result["data"]
+            if isinstance(priorities_result, dict)
+            else priorities_result
+        )
+
+        fallback_result = self.get_data_with_fallback(
             "get_valuation_data", priorities, symbol, trade_date
+        )
+        return (
+            fallback_result["data"]
+            if isinstance(fallback_result, dict)
+            else fallback_result
         )
 
     def _parse_market_from_symbol(self, symbol: str) -> str:
@@ -344,6 +487,7 @@ class DataSourceManager:
             else:
                 return "SZ"
 
+    @unified_error_handler(return_dict=True)
     def health_check(self) -> Dict[str, Any]:
         """健康检查"""
         results = {}
@@ -394,11 +538,19 @@ class DataSourceManager:
 
         return results
 
+    @unified_error_handler(return_dict=True)
     def get_status(self) -> Dict[str, Any]:
         """获取管理器状态"""
+        available_sources_result = self.get_available_sources()
+        available_sources = (
+            available_sources_result["data"]
+            if isinstance(available_sources_result, dict)
+            else available_sources_result
+        )
+
         return {
             "sources": self.source_status.copy(),
-            "available_sources": self.get_available_sources(),
+            "available_sources": available_sources,
             "total_sources": len(self.sources),
             "healthy_sources": len(
                 [
@@ -415,9 +567,9 @@ class DataSourceManager:
             try:
                 source.disconnect()
                 self.source_status[source_name]["connected"] = False
-                logger.info(f"数据源 {source_name} 已断开")
+                self.logger.info(f"数据源 {source_name} 已断开")
             except Exception as e:
-                logger.error(f"断开数据源 {source_name} 失败: {e}")
+                self._log_error("disconnect_all", e, source_name=source_name)
 
     def __enter__(self):
         """上下文管理器入口"""
@@ -426,6 +578,7 @@ class DataSourceManager:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """上下文管理器出口"""
         self.disconnect_all()
+        return False
 
     def __del__(self):
         """析构函数"""

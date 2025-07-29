@@ -4,15 +4,18 @@
 提供多级缓存、缓存策略和缓存性能优化功能。
 """
 
+# 标准库导入
 import logging
 import pickle
 import threading
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
+# 项目内导入
 from ..config import Config
+from ..core import BaseManager, ValidationError, unified_error_handler
 
 logger = logging.getLogger(__name__)
 
@@ -160,25 +163,28 @@ class MemoryCache(CacheBackend):
             return 0
 
 
-class CacheManager:
+class CacheManager(BaseManager):
     """缓存管理器"""
 
-    def __init__(self, config: Config = None):
+    def __init__(self, config: Optional[Config] = None, **kwargs):
         """
         初始化缓存管理器
 
         Args:
             config: 配置对象
         """
-        self.config = config or Config()
+        super().__init__(config=config, **kwargs)
 
-        # 缓存配置
-        self.enable_l1_cache = self.config.get("cache_manager.enable_l1_cache", True)
-        self.enable_l2_cache = self.config.get("cache_manager.enable_l2_cache", True)
-        self.l1_max_size = self.config.get("cache_manager.l1_max_size", 1000)
-        self.l2_max_size = self.config.get("cache_manager.l2_max_size", 10000)
-        self.default_ttl = self.config.get("cache_manager.default_ttl", 3600)
+    def _init_specific_config(self):
+        """初始化缓存管理器特定配置"""
+        self.enable_l1_cache = self._get_config("cache_manager.enable_l1_cache", True)
+        self.enable_l2_cache = self._get_config("cache_manager.enable_l2_cache", True)
+        self.l1_max_size = self._get_config("cache_manager.l1_max_size", 1000)
+        self.l2_max_size = self._get_config("cache_manager.l2_max_size", 10000)
+        self.default_ttl = self._get_config("cache_manager.default_ttl", 3600)
 
+    def _init_components(self):
+        """初始化组件"""
         # 初始化缓存层
         self.l1_cache = (
             MemoryCache(self.l1_max_size, self.default_ttl)
@@ -215,8 +221,11 @@ class CacheManager:
         self.cleanup_thread = threading.Thread(target=self._cleanup_worker, daemon=True)
         self.cleanup_thread.start()
 
-        logger.info("缓存管理器初始化完成")
+    def _get_required_attributes(self) -> List[str]:
+        """必需属性列表"""
+        return ["stats", "cache_strategies", "cleanup_thread"]
 
+    @unified_error_handler(return_dict=True)
     def get(self, key: str, data_type: str = "default") -> Optional[Any]:
         """
         获取缓存值
@@ -228,41 +237,40 @@ class CacheManager:
         Returns:
             Optional[Any]: 缓存值
         """
-        try:
-            # 生成完整的缓存键
-            full_key = self._generate_cache_key(key, data_type)
+        if not key:
+            raise ValidationError("缓存键不能为空")
 
-            # L1缓存查找
-            if self.l1_cache:
-                value = self.l1_cache.get(full_key)
-                if value is not None:
-                    self.stats["l1_hits"] += 1
-                    return value
-                else:
-                    self.stats["l1_misses"] += 1
+        # 生成完整的缓存键
+        full_key = self._generate_cache_key(key, data_type)
 
-            # L2缓存查找
-            if self.l2_cache:
-                value = self.l2_cache.get(full_key)
-                if value is not None:
-                    self.stats["l2_hits"] += 1
+        # L1缓存查找
+        if self.l1_cache:
+            value = self.l1_cache.get(full_key)
+            if value is not None:
+                self.stats["l1_hits"] += 1
+                return value
+            else:
+                self.stats["l1_misses"] += 1
 
-                    # 提升到L1缓存
-                    if self.l1_cache:
-                        strategy = self.cache_strategies.get(data_type, {})
-                        ttl = strategy.get("ttl", self.default_ttl)
-                        self.l1_cache.set(full_key, value, ttl)
+        # L2缓存查找
+        if self.l2_cache:
+            value = self.l2_cache.get(full_key)
+            if value is not None:
+                self.stats["l2_hits"] += 1
 
-                    return value
-                else:
-                    self.stats["l2_misses"] += 1
+                # 提升到L1缓存
+                if self.l1_cache:
+                    strategy = self.cache_strategies.get(data_type, {})
+                    ttl = strategy.get("ttl", self.default_ttl)
+                    self.l1_cache.set(full_key, value, ttl)
 
-            return None
+                return value
+            else:
+                self.stats["l2_misses"] += 1
 
-        except Exception as e:
-            logger.error(f"获取缓存失败: {e}")
-            return None
+        return None
 
+    @unified_error_handler(return_dict=True)
     def set(
         self, key: str, value: Any, data_type: str = "default", ttl: int = None
     ) -> bool:
@@ -278,36 +286,35 @@ class CacheManager:
         Returns:
             bool: 是否成功
         """
-        try:
-            # 生成完整的缓存键
-            full_key = self._generate_cache_key(key, data_type)
+        if not key:
+            raise ValidationError("缓存键不能为空")
 
-            # 获取缓存策略
-            strategy = self.cache_strategies.get(data_type, {})
-            cache_ttl = ttl or strategy.get("ttl", self.default_ttl)
-            cache_level = strategy.get("level", "l1")
+        # 生成完整的缓存键
+        full_key = self._generate_cache_key(key, data_type)
 
-            success = False
+        # 获取缓存策略
+        strategy = self.cache_strategies.get(data_type, {})
+        cache_ttl = ttl or strategy.get("ttl", self.default_ttl)
+        cache_level = strategy.get("level", "l1")
 
-            # 根据策略选择缓存层
-            if cache_level == "l1" and self.l1_cache:
+        success = False
+
+        # 根据策略选择缓存层
+        if cache_level == "l1" and self.l1_cache:
+            success = self.l1_cache.set(full_key, value, cache_ttl)
+        elif cache_level == "l2" and self.l2_cache:
+            success = self.l2_cache.set(full_key, value, cache_ttl)
+        else:
+            # 默认存储到L1
+            if self.l1_cache:
                 success = self.l1_cache.set(full_key, value, cache_ttl)
-            elif cache_level == "l2" and self.l2_cache:
-                success = self.l2_cache.set(full_key, value, cache_ttl)
-            else:
-                # 默认存储到L1
-                if self.l1_cache:
-                    success = self.l1_cache.set(full_key, value, cache_ttl)
 
-            if success:
-                self.stats["sets"] += 1
+        if success:
+            self.stats["sets"] += 1
 
-            return success
+        return success
 
-        except Exception as e:
-            logger.error(f"设置缓存失败: {e}")
-            return False
-
+    @unified_error_handler(return_dict=True)
     def delete(self, key: str, data_type: str = "default") -> bool:
         """
         删除缓存值
@@ -319,27 +326,26 @@ class CacheManager:
         Returns:
             bool: 是否成功
         """
-        try:
-            full_key = self._generate_cache_key(key, data_type)
+        if not key:
+            raise ValidationError("缓存键不能为空")
 
-            success = False
+        full_key = self._generate_cache_key(key, data_type)
 
-            # 从所有缓存层删除
-            if self.l1_cache:
-                success |= self.l1_cache.delete(full_key)
+        success = False
 
-            if self.l2_cache:
-                success |= self.l2_cache.delete(full_key)
+        # 从所有缓存层删除
+        if self.l1_cache:
+            success |= self.l1_cache.delete(full_key)
 
-            if success:
-                self.stats["deletes"] += 1
+        if self.l2_cache:
+            success |= self.l2_cache.delete(full_key)
 
-            return success
+        if success:
+            self.stats["deletes"] += 1
 
-        except Exception as e:
-            logger.error(f"删除缓存失败: {e}")
-            return False
+        return success
 
+    @unified_error_handler(return_dict=True)
     def clear(self, data_type: str = None) -> bool:
         """
         清空缓存
@@ -350,24 +356,20 @@ class CacheManager:
         Returns:
             bool: 是否成功
         """
-        try:
-            if data_type is None:
-                # 清空所有缓存
-                success = True
-                if self.l1_cache:
-                    success &= self.l1_cache.clear()
-                if self.l2_cache:
-                    success &= self.l2_cache.clear()
-                return success
-            else:
-                # 清空特定类型的缓存
-                # 这里简化实现，实际应该根据键前缀删除
-                return True
+        if data_type is None:
+            # 清空所有缓存
+            success = True
+            if self.l1_cache:
+                success &= self.l1_cache.clear()
+            if self.l2_cache:
+                success &= self.l2_cache.clear()
+            return success
+        else:
+            # 清空特定类型的缓存
+            # 这里简化实现，实际应该根据键前缀删除
+            return True
 
-        except Exception as e:
-            logger.error(f"清空缓存失败: {e}")
-            return False
-
+    @unified_error_handler(return_dict=True)
     def exists(self, key: str, data_type: str = "default") -> bool:
         """
         检查缓存是否存在
@@ -379,8 +381,15 @@ class CacheManager:
         Returns:
             bool: 是否存在
         """
-        return self.get(key, data_type) is not None
+        if not key:
+            raise ValidationError("缓存键不能为空")
 
+        get_result = self.get(key, data_type)
+        if isinstance(get_result, dict) and "data" in get_result:
+            return get_result["data"] is not None
+        return get_result is not None
+
+    @unified_error_handler(return_dict=True)
     def get_cache_stats(self) -> Dict[str, Any]:
         """获取缓存统计"""
         total_requests = (
@@ -457,11 +466,12 @@ class CacheManager:
 
                 if expired_count > 0:
                     self.stats["evictions"] += expired_count
-                    logger.debug(f"清理过期缓存: {expired_count} 个条目")
+                    self.logger.debug(f"清理过期缓存: {expired_count} 个条目")
 
             except Exception as e:
-                logger.error(f"缓存清理失败: {e}")
+                self._log_error("_cleanup_worker", e)
 
+    @unified_error_handler(return_dict=True)
     def add_cache_strategy(self, data_type: str, ttl: int, level: str = "l1"):
         """
         添加缓存策略
@@ -471,9 +481,20 @@ class CacheManager:
             ttl: 生存时间
             level: 缓存级别
         """
-        self.cache_strategies[data_type] = {"ttl": ttl, "level": level}
-        logger.info(f"添加缓存策略: {data_type} -> TTL={ttl}, Level={level}")
+        if not data_type:
+            raise ValidationError("数据类型不能为空")
 
+        if ttl is None or ttl < 0:
+            raise ValidationError("TTL必须为非负数")
+
+        if level not in ["l1", "l2"]:
+            raise ValidationError("缓存级别必须为l1或l2")
+
+        self.cache_strategies[data_type] = {"ttl": ttl, "level": level}
+        self.logger.info(f"添加缓存策略: {data_type} -> TTL={ttl}, Level={level}")
+        return True
+
+    @unified_error_handler(return_dict=True)
     def get_cache_strategies(self) -> Dict[str, Dict[str, Any]]:
         """获取缓存策略"""
         return self.cache_strategies.copy()

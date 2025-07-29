@@ -309,13 +309,15 @@ class TestSyncManager:
 
         status = manager.get_sync_status()
 
-        assert "recent_syncs" in status
-        assert "data_stats" in status
-        assert "components" in status
-        assert "config" in status
+        # 新架构返回字典格式，需要检查success字段和data字段
+        assert status["success"] == True
+        assert "recent_syncs" in status["data"]
+        assert "data_stats" in status["data"]
+        assert "components" in status["data"]
+        assert "config" in status["data"]
 
         # 检查数据统计
-        data_stats = status["data_stats"]
+        data_stats = status["data"]["data_stats"]
         assert data_stats["total_records"] == 1000
         assert data_stats["total_symbols"] == 50
 
@@ -422,8 +424,9 @@ def test_sync_system_integration():
 
     # 测试获取同步状态
     status = sync_manager.get_sync_status()
-    assert "data_stats" in status
-    assert status["data_stats"]["total_records"] == 1000
+    assert status["success"] == True
+    assert "data_stats" in status["data"]
+    assert status["data"]["data_stats"]["total_records"] == 1000
 
     # 测试报告生成
     mock_full_result = {
