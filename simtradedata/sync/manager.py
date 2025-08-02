@@ -411,36 +411,64 @@ class SyncManager(BaseManager):
 
     def get_sync_status(self) -> Dict[str, Any]:
         """获取同步状态"""
-        # 获取最近的同步状态
-        sql = """
-        SELECT * FROM sync_status
-        ORDER BY last_sync_date DESC
-        LIMIT 10
-        """
-        recent_syncs = self.db_manager.fetchall(sql)
+        try:
+            # 获取最近的同步状态
+            sql = """
+            SELECT * FROM sync_status
+            ORDER BY last_sync_date DESC
+            LIMIT 10
+            """
+            recent_syncs = self.db_manager.fetchall(sql)
 
-        # 获取数据统计
-        stats_sql = """
-        SELECT 
-            COUNT(*) as total_records,
-            COUNT(DISTINCT symbol) as total_symbols,
-            COUNT(DISTINCT date) as total_dates,
-            MIN(date) as earliest_date,
-            MAX(date) as latest_date,
-            AVG(quality_score) as avg_quality
-        FROM market_data
-        """
-        stats_result = self.db_manager.fetchone(stats_sql)
+            # 获取数据统计
+            stats_sql = """
+            SELECT 
+                COUNT(*) as total_records,
+                COUNT(DISTINCT symbol) as total_symbols,
+                COUNT(DISTINCT date) as total_dates,
+                MIN(date) as earliest_date,
+                MAX(date) as latest_date,
+                AVG(quality_score) as avg_quality
+            FROM market_data
+            """
+            stats_result = self.db_manager.fetchone(stats_sql)
 
-        return {
-            "recent_syncs": [dict(row) for row in recent_syncs],
-            "data_stats": dict(stats_result) if stats_result else {},
-            "config": {
-                "enable_auto_gap_fix": self.enable_auto_gap_fix,
-                "enable_validation": self.enable_validation,
-                "max_gap_fix_days": self.max_gap_fix_days,
-            },
-        }
+            # 获取组件状态
+            components_status = {
+                "incremental_sync": {
+                    "initialized": hasattr(self, "incremental_sync")
+                    and self.incremental_sync is not None,
+                    "type": "IncrementalSync",
+                },
+                "gap_detector": {
+                    "initialized": hasattr(self, "gap_detector")
+                    and self.gap_detector is not None,
+                    "type": "GapDetector",
+                },
+                "validator": {
+                    "initialized": hasattr(self, "validator")
+                    and self.validator is not None,
+                    "type": "DataValidator",
+                },
+            }
+
+            # 返回标准格式
+            return {
+                "success": True,
+                "data": {
+                    "recent_syncs": [dict(row) for row in recent_syncs],
+                    "data_stats": dict(stats_result) if stats_result else {},
+                    "components": components_status,
+                    "config": {
+                        "enable_auto_gap_fix": self.enable_auto_gap_fix,
+                        "enable_validation": self.enable_validation,
+                        "max_gap_fix_days": self.max_gap_fix_days,
+                    },
+                },
+            }
+        except Exception as e:
+            self.logger.error(f"获取同步状态失败: {e}")
+            return {"success": False, "error": str(e)}
 
     def _get_active_stocks_from_db(self) -> List[str]:
         """从数据库获取活跃股票列表"""
