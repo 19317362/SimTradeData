@@ -29,6 +29,79 @@ from .validator import DataValidator
 logger = logging.getLogger(__name__)
 
 
+class DataQualityValidator:
+    """数据质量验证器"""
+
+    @staticmethod
+    def is_valid_financial_data(data: Dict[str, Any]) -> bool:
+        """验证财务数据有效性"""
+        if not data or not isinstance(data, dict):
+            return False
+
+        # 检查是否有有效的财务指标
+        revenue = data.get("revenue", 0)
+        net_profit = data.get("net_profit", 0)
+        total_assets = data.get("total_assets", 0)
+
+        # 至少要有一个非零的主要财务指标
+        return (
+            (revenue and revenue > 0)
+            or (total_assets and total_assets > 0)
+            or (net_profit != 0)  # 净利润可以为负
+        )
+
+    @staticmethod
+    def is_valid_valuation_data(data: Dict[str, Any]) -> bool:
+        """验证估值数据有效性"""
+        if not data or not isinstance(data, dict):
+            return False
+
+        pe_ratio = data.get("pe_ratio", 0)
+        pb_ratio = data.get("pb_ratio", 0)
+        market_cap = data.get("market_cap", 0)
+
+        # PE/PB应该为正数且在合理范围内，市值应该大于0
+        return (
+            (pe_ratio and 0 < pe_ratio < 1000)
+            or (pb_ratio and 0 < pb_ratio < 100)
+            or (market_cap and market_cap > 0)
+        )
+
+    @staticmethod
+    def is_valid_report_date(report_date: str, symbol: str = None) -> bool:
+        """验证报告期有效性"""
+        try:
+            from datetime import datetime
+
+            report_dt = datetime.strptime(report_date, "%Y-%m-%d")
+            current_dt = datetime.now()
+
+            # 报告期不能是未来日期
+            if report_dt > current_dt:
+                return False
+
+            # 报告期不能太久远（比如1990年以前）
+            if report_dt.year < 1990:
+                return False
+
+            return True
+        except (ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def is_valid_stock_basic_info(data: Dict[str, Any]) -> bool:
+        """验证股票基础信息有效性"""
+        if not data or not isinstance(data, dict):
+            return False
+
+        # 检查关键字段
+        symbol = data.get("symbol", "")
+        name = data.get("name", "")
+        market = data.get("market", "")
+
+        return bool(symbol and name and market)
+
+
 class SyncManager(BaseManager):
     """同步管理器"""
 
@@ -734,35 +807,213 @@ class SyncManager(BaseManager):
         """增量更新股票列表"""
         self.logger.info("🔄 开始股票列表增量更新...")
 
-        # 获取股票信息
-        stock_info = self.data_source_manager.get_stock_info()
+        try:
+            # 获取股票信息
+            stock_info = self.data_source_manager.get_stock_info()
 
-        # 解包嵌套数据
-        if isinstance(stock_info, dict) and "data" in stock_info:
-            stock_info = stock_info["data"]
+            # 解包嵌套数据
             if isinstance(stock_info, dict) and "data" in stock_info:
                 stock_info = stock_info["data"]
+                if isinstance(stock_info, dict) and "data" in stock_info:
+                    stock_info = stock_info["data"]
 
-        if stock_info is None:
+            if stock_info is None:
+                self.logger.warning("获取股票列表失败：数据为空")
+                return {
+                    "status": "failed",
+                    "error": "获取股票列表失败：数据为空",
+                    "total_stocks": 0,
+                    "new_stocks": 0,
+                    "updated_stocks": 0,
+                }
+
+            # 转换DataFrame为列表格式
+            if hasattr(stock_info, "iterrows"):
+                stock_list = []
+                for _, row in stock_info.iterrows():
+                    stock_data = {
+                        "symbol": str(row.get("代码", "")),
+                        "name": str(row.get("名称", "")),
+                        "market": self._determine_market(str(row.get("代码", ""))),
+                    }
+                    if stock_data["symbol"] and stock_data["name"]:
+                        stock_list.append(stock_data)
+                stock_info = stock_list
+
+            if not stock_info or not hasattr(stock_info, "__len__"):
+                self.logger.warning("股票列表数据格式不正确")
+                return {
+                    "status": "failed",
+                    "error": "股票列表数据格式不正确",
+                    "total_stocks": 0,
+                    "new_stocks": 0,
+                    "updated_stocks": 0,
+                }
+
+            # 处理每只股票
+            new_stocks = 0
+            updated_stocks = 0
+            failed_stocks = 0
+
+            for stock_data in stock_info:
+                symbol = None  # 初始化symbol变量
+                try:
+                    symbol = stock_data.get("symbol", "")
+                    name = stock_data.get("name", "")
+                    market = stock_data.get("market", "")
+
+                    if not symbol or not name:
+                        continue
+
+                    # 添加市场后缀
+                    if "." not in symbol:
+                        if symbol.startswith("0") or symbol.startswith("3"):
+                            symbol = f"{symbol}.SZ"
+                        elif symbol.startswith("6") or symbol.startswith("9"):
+                            symbol = f"{symbol}.SS"
+
+                    # 检查是否已存在
+                    existing = self.db_manager.fetchone(
+                        "SELECT symbol FROM stocks WHERE symbol = ?", (symbol,)
+                    )
+
+                    if existing:
+                        # 更新股票信息（只更新名称，保留其他信息）
+                        self.db_manager.execute(
+                            "UPDATE stocks SET name = ? WHERE symbol = ?",
+                            (name, symbol),
+                        )
+                        updated_stocks += 1
+                    else:
+                        # 插入新股票
+                        self.db_manager.execute(
+                            """
+                            INSERT INTO stocks (symbol, name, market, exchange, status, created_at) 
+                            VALUES (?, ?, ?, ?, 'active', datetime('now'))
+                            """,
+                            (symbol, name, market, market),
+                        )
+                        new_stocks += 1
+
+                        # 获取详细信息（股本等）
+                        self._fetch_detailed_stock_info(symbol)
+
+                except Exception as e:
+                    # 安全地引用symbol，即使它可能为None
+                    symbol_str = symbol if symbol else "未知股票"
+                    self.logger.warning(f"处理股票 {symbol_str} 失败: {e}")
+                    failed_stocks += 1
+                    continue
+
+            total_processed = new_stocks + updated_stocks
+
+            self.logger.info(
+                f"股票列表更新完成: 新增 {new_stocks}只, 更新 {updated_stocks}只, 失败 {failed_stocks}只"
+            )
+
             return {
                 "status": "completed",
+                "total_stocks": total_processed,
+                "new_stocks": new_stocks,
+                "updated_stocks": updated_stocks,
+                "failed_stocks": failed_stocks,
+            }
+
+        except Exception as e:
+            self.logger.error(f"更新股票列表失败: {e}")
+            return {
+                "status": "failed",
+                "error": str(e),
                 "total_stocks": 0,
                 "new_stocks": 0,
                 "updated_stocks": 0,
             }
 
-        # 统计数量
-        if hasattr(stock_info, "__len__"):
-            total_processed = len(stock_info)
+    def _determine_market(self, symbol: str) -> str:
+        """确定股票市场"""
+        if symbol.startswith("0") or symbol.startswith("3"):
+            return "SZ"
+        elif symbol.startswith("6") or symbol.startswith("9"):
+            return "SS"
+        elif symbol.startswith("8"):
+            return "BJ"  # 北交所
         else:
-            total_processed = 0
+            return "SZ"  # 默认深圳
 
-        return {
-            "status": "completed",
-            "total_stocks": total_processed,
-            "new_stocks": total_processed,
-            "updated_stocks": 0,
-        }
+    def _fetch_detailed_stock_info(self, symbol: str):
+        """获取股票详细信息（股本、上市日期等）"""
+        try:
+            # 获取股票详细信息
+            detail_info = self.data_source_manager.get_stock_info(symbol)
+
+            if isinstance(detail_info, dict) and "data" in detail_info:
+                detail_info = detail_info["data"]
+
+            if detail_info is None or (
+                hasattr(detail_info, "empty") and detail_info.empty
+            ):
+                return
+
+            # 解析详细信息
+            if hasattr(detail_info, "iloc") and len(detail_info) > 0:
+                row = detail_info.iloc[0]
+
+                # 提取有用信息
+                total_shares = self._safe_extract_number(row.get("总股本", 0))
+                float_shares = self._safe_extract_number(row.get("流通股", 0))
+                list_date = self._safe_extract_date(row.get("上市日期", ""))
+                industry = str(row.get("行业", ""))
+
+                # 更新股票详细信息
+                if total_shares or float_shares or list_date or industry:
+                    self.db_manager.execute(
+                        """
+                        UPDATE stocks 
+                        SET total_shares = ?, float_shares = ?, list_date = ?, industry_l1 = ?
+                        WHERE symbol = ?
+                        """,
+                        (total_shares, float_shares, list_date, industry, symbol),
+                    )
+                    self.logger.debug(f"更新股票详细信息: {symbol}")
+
+        except Exception as e:
+            self.logger.debug(f"获取 {symbol} 详细信息失败: {e}")
+
+    def _safe_extract_number(self, value, default=None):
+        """安全提取数字"""
+        try:
+            if value is None or value == "" or str(value).lower() == "nan":
+                return default
+            # 移除可能的单位（万、亿等）
+            str_value = str(value).replace(",", "").replace("万", "").replace("亿", "")
+            if "万" in str(value):
+                return float(str_value) * 10000
+            elif "亿" in str(value):
+                return float(str_value) * 100000000
+            else:
+                return float(str_value)
+        except (ValueError, TypeError):
+            return default
+
+    def _safe_extract_date(self, value, default=None):
+        """安全提取日期"""
+        try:
+            if value is None or value == "" or str(value).lower() == "nan":
+                return default
+            # 尝试解析日期格式
+            import re
+
+            str_value = str(value)
+            # 匹配 YYYY-MM-DD 格式
+            if re.match(r"\d{4}-\d{2}-\d{2}", str_value):
+                return str_value[:10]
+            # 匹配 YYYYMMDD 格式
+            elif re.match(r"\d{8}", str_value):
+                return f"{str_value[:4]}-{str_value[4:6]}-{str_value[6:8]}"
+            else:
+                return default
+        except Exception:
+            return default
 
     def _sync_extended_data(
         self, symbols: List[str], target_date: date, progress_bar=None
@@ -814,58 +1065,98 @@ class SyncManager(BaseManager):
                 (symbol, "processing", str(target_date), "processing", session_id),
             )
 
-            # 处理财务数据
-            financial_data = self.data_source_manager.get_fundamentals(
-                symbol, f"{target_date.year}-12-31", "Q4"
-            )
-            if (
-                financial_data
-                and isinstance(financial_data, dict)
-                and "data" in financial_data
-            ):
-                # 使用通用执行方法插入财务数据
-                self.db_manager.execute(
-                    "INSERT OR REPLACE INTO financials (symbol, report_date, report_type, revenue, net_profit, source, created_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
-                    (
-                        symbol,
-                        f"{target_date.year}-12-31",
-                        "Q4",
-                        financial_data["data"].get("revenue", 0),
-                        financial_data["data"].get("net_profit", 0),
-                        "akshare",
-                    ),
-                )
-                result["financials_count"] += 1
+            # 处理财务数据 - 使用最近一年的年报数据
+            report_year = target_date.year - 1  # 使用去年年报
+            report_date_str = f"{report_year}-12-31"
+
+            # 验证报告期有效性
+            if not DataQualityValidator.is_valid_report_date(report_date_str, symbol):
+                self.logger.warning(f"跳过无效报告期: {symbol} {report_date_str}")
+            else:
+                try:
+                    financial_data = self.data_source_manager.get_fundamentals(
+                        symbol, report_date_str, "Q4"
+                    )
+
+                    # 解包数据
+                    if isinstance(financial_data, dict) and "data" in financial_data:
+                        financial_data = financial_data["data"]
+
+                    # 验证财务数据有效性
+                    if financial_data and DataQualityValidator.is_valid_financial_data(
+                        financial_data
+                    ):
+                        self.db_manager.execute(
+                            "INSERT OR REPLACE INTO financials (symbol, report_date, report_type, revenue, net_profit, total_assets, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+                            (
+                                symbol,
+                                report_date_str,
+                                "Q4",
+                                financial_data.get("revenue", 0),
+                                financial_data.get("net_profit", 0),
+                                financial_data.get("total_assets", 0),
+                                "akshare",
+                            ),
+                        )
+                        result["financials_count"] += 1
+                        self.logger.debug(f"财务数据插入成功: {symbol}")
+                    else:
+                        self.logger.debug(f"财务数据无效，跳过: {symbol}")
+
+                except Exception as e:
+                    self.logger.warning(f"获取财务数据失败: {symbol} - {e}")
 
             # 处理估值数据
-            valuation_data = self.data_source_manager.get_valuation_data(
-                symbol, str(target_date)
-            )
-            if (
-                valuation_data
-                and isinstance(valuation_data, dict)
-                and "data" in valuation_data
-            ):
-                # 使用通用执行方法插入估值数据
-                self.db_manager.execute(
-                    "INSERT OR REPLACE INTO valuations (symbol, date, pe_ratio, pb_ratio, source, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))",
-                    (
-                        symbol,
-                        str(target_date),
-                        valuation_data["data"].get("pe_ratio", 0),
-                        valuation_data["data"].get("pb_ratio", 0),
-                        "akshare",
-                    ),
+            try:
+                valuation_data = self.data_source_manager.get_valuation_data(
+                    symbol, str(target_date)
                 )
-                result["valuations_count"] += 1
 
-            # 处理技术指标 - 简化处理
-            # 使用虚拟数据插入技术指标
-            self.db_manager.execute(
-                "INSERT OR REPLACE INTO technical_indicators (symbol, date, ma5, ma10, calculated_at) VALUES (?, ?, ?, ?, datetime('now'))",
-                (symbol, str(target_date), 0.0, 0.0),
-            )
-            result["indicators_count"] += 1
+                # 解包数据
+                if isinstance(valuation_data, dict) and "data" in valuation_data:
+                    valuation_data = valuation_data["data"]
+
+                # 验证估值数据有效性
+                if valuation_data and DataQualityValidator.is_valid_valuation_data(
+                    valuation_data
+                ):
+                    self.db_manager.execute(
+                        "INSERT OR REPLACE INTO valuations (symbol, date, pe_ratio, pb_ratio, market_cap, source, created_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+                        (
+                            symbol,
+                            str(target_date),
+                            valuation_data.get("pe_ratio", None),
+                            valuation_data.get("pb_ratio", None),
+                            valuation_data.get("market_cap", None),
+                            "akshare",
+                        ),
+                    )
+                    result["valuations_count"] += 1
+                    self.logger.debug(f"估值数据插入成功: {symbol}")
+                else:
+                    self.logger.debug(f"估值数据无效，跳过: {symbol}")
+
+            except Exception as e:
+                self.logger.warning(f"获取估值数据失败: {symbol} - {e}")
+
+            # 处理技术指标 - 只有当有市场数据时才计算
+            try:
+                # 检查是否有足够的市场数据来计算技术指标
+                market_data_count = self.db_manager.fetchone(
+                    "SELECT COUNT(*) as count FROM market_data WHERE symbol = ? AND date <= ? ORDER BY date DESC LIMIT 20",
+                    (symbol, str(target_date)),
+                )
+
+                if (
+                    market_data_count and market_data_count["count"] >= 10
+                ):  # 至少需要10天数据
+                    # 这里应该调用真正的技术指标计算，暂时跳过虚假数据插入
+                    self.logger.debug(f"技术指标计算需要实现，跳过: {symbol}")
+                else:
+                    self.logger.debug(f"市场数据不足，无法计算技术指标: {symbol}")
+
+            except Exception as e:
+                self.logger.warning(f"技术指标处理失败: {symbol} - {e}")
 
             # 标记完成处理
             self.db_manager.execute(

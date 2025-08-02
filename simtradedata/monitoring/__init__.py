@@ -1,9 +1,9 @@
 """
 监控模块
 
-删除过度的健壮性代码，保持简洁。
+提供系统监控、性能监控和数据质量监控功能。
 """
 
-# 删除所有过度的监控组件
+from .data_quality import DataQualityMonitor
 
-__all__ = []
+__all__ = ["DataQualityMonitor"]

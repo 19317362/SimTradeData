@@ -7,7 +7,7 @@ AkShare数据源适配器
 import logging
 import os
 from datetime import date
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 # 禁用AkShare的进度条
 os.environ["TQDM_DISABLE"] = "1"
@@ -90,7 +90,7 @@ class AkShareAdapter(BaseDataSource):
                 adjust="qfq",  # 前复权
             )
 
-            return df
+            return self._convert_daily_data(df, symbol)
 
         return self._retry_request(_fetch_data)
 
@@ -173,20 +173,181 @@ class AkShareAdapter(BaseDataSource):
             self.connect()
 
         def _fetch_data():
-            if symbol:
-                # 获取单个股票信息
-                symbol_norm = self._normalize_symbol(symbol)
-                ak_symbol = self._convert_to_akshare_symbol(symbol_norm)
+            try:
+                if symbol:
+                    # 获取单个股票信息
+                    symbol_norm = self._normalize_symbol(symbol)
+                    ak_symbol = self._convert_to_akshare_symbol(symbol_norm)
 
-                # 获取股票基本信息
-                df = self._akshare.stock_individual_info_em(symbol=ak_symbol)
-                return df
-            else:
-                # 获取所有股票列表
-                df = self._akshare.stock_info_a_code_name()
-                return df
+                    # 获取股票基本信息
+                    try:
+                        df = self._akshare.stock_individual_info_em(symbol=ak_symbol)
+                        return self._convert_stock_detail_data(df, symbol_norm)
+                    except Exception as e:
+                        logger.warning(f"获取单个股票信息失败 {symbol}: {e}")
+                        # 尝试从股票列表中获取基本信息
+                        all_stocks = self._akshare.stock_info_a_code_name()
+                        if not all_stocks.empty:
+                            stock_row = all_stocks[all_stocks["代码"] == ak_symbol]
+                            if not stock_row.empty:
+                                return self._convert_basic_stock_data(
+                                    stock_row.iloc[0], symbol_norm
+                                )
+                        return {"success": False, "data": None, "error": str(e)}
+                else:
+                    # 获取所有股票列表
+                    df = self._akshare.stock_info_a_code_name()
+                    return self._convert_stock_list_data(df)
+
+            except Exception as e:
+                logger.error(f"获取股票信息失败: {e}")
+                return {"success": False, "data": None, "error": str(e)}
 
         return self._retry_request(_fetch_data)
+
+    def _convert_stock_list_data(self, df) -> Dict[str, Any]:
+        """转换股票列表数据格式"""
+        if df is None or df.empty:
+            return {"success": False, "data": None, "error": "股票列表为空"}
+
+        try:
+            # 转换为标准格式
+            stocks = []
+            for _, row in df.iterrows():
+                code = str(row.get("代码", ""))
+                name = str(row.get("名称", ""))
+
+                if code and name and len(code) == 6:  # 确保是6位代码
+                    stock_data = {
+                        "symbol": code,  # 不带后缀的代码
+                        "name": name.strip(),
+                        "market": self._determine_market_from_code(code),
+                    }
+                    stocks.append(stock_data)
+
+            return {"success": True, "data": stocks, "count": len(stocks)}
+
+        except Exception as e:
+            logger.error(f"转换股票列表数据失败: {e}")
+            return {"success": False, "data": None, "error": str(e)}
+
+    def _convert_stock_detail_data(self, df, symbol: str) -> Dict[str, Any]:
+        """转换股票详细信息数据格式"""
+        if df is None or df.empty:
+            return {"success": False, "data": None, "error": "股票详细信息为空"}
+
+        try:
+            # 将Series转换为字典
+            if hasattr(df, "to_dict"):
+                data_dict = df.to_dict()
+            else:
+                data_dict = dict(df)
+
+            # 提取关键信息
+            detail_data = {
+                "symbol": symbol,
+                "name": self._safe_str(data_dict.get("股票简称", "")),
+                "total_shares": self._extract_shares(data_dict.get("总股本", 0)),
+                "float_shares": self._extract_shares(data_dict.get("流通股", 0)),
+                "list_date": self._extract_date(data_dict.get("上市日期", "")),
+                "industry": self._safe_str(data_dict.get("所属行业", "")),
+                "market_cap": self._extract_number(data_dict.get("总市值", 0)),
+            }
+
+            return {"success": True, "data": detail_data}
+
+        except Exception as e:
+            logger.error(f"转换股票详细信息失败 {symbol}: {e}")
+            return {"success": False, "data": None, "error": str(e)}
+
+    def _convert_basic_stock_data(self, row, symbol: str) -> Dict[str, Any]:
+        """转换基本股票数据格式"""
+        try:
+            basic_data = {
+                "symbol": symbol,
+                "name": self._safe_str(row.get("名称", "")),
+                "market": self._determine_market_from_code(
+                    self._convert_to_akshare_symbol(symbol)
+                ),
+            }
+
+            return {"success": True, "data": basic_data}
+
+        except Exception as e:
+            logger.error(f"转换基本股票数据失败 {symbol}: {e}")
+            return {"success": False, "data": None, "error": str(e)}
+
+    def _determine_market_from_code(self, code: str) -> str:
+        """从股票代码确定市场"""
+        if code.startswith("0") or code.startswith("3"):
+            return "SZ"
+        elif code.startswith("6") or code.startswith("9"):
+            return "SS"
+        elif code.startswith("8"):
+            return "BJ"
+        else:
+            return "SZ"
+
+    def _extract_shares(self, value) -> Optional[float]:
+        """提取股本数据（单位：股）"""
+        try:
+            if value is None or str(value).lower() in ["nan", "", "--"]:
+                return None
+
+            str_value = str(value).replace(",", "").strip()
+
+            # 处理带单位的数据
+            if "万股" in str_value:
+                num_value = float(str_value.replace("万股", ""))
+                return num_value * 10000
+            elif "亿股" in str_value:
+                num_value = float(str_value.replace("亿股", ""))
+                return num_value * 100000000
+            elif "股" in str_value:
+                return float(str_value.replace("股", ""))
+            else:
+                # 假设已经是股数
+                return float(str_value)
+
+        except (ValueError, TypeError):
+            return None
+
+    def _extract_number(self, value) -> Optional[float]:
+        """提取数值"""
+        try:
+            if value is None or str(value).lower() in ["nan", "", "--"]:
+                return None
+            return float(str(value).replace(",", ""))
+        except (ValueError, TypeError):
+            return None
+
+    def _extract_date(self, value) -> Optional[str]:
+        """提取日期"""
+        try:
+            if value is None or str(value).lower() in ["nan", "", "--"]:
+                return None
+
+            import re
+
+            str_value = str(value).strip()
+
+            # YYYY-MM-DD 格式
+            if re.match(r"\d{4}-\d{2}-\d{2}", str_value):
+                return str_value[:10]
+            # YYYYMMDD 格式
+            elif re.match(r"\d{8}", str_value):
+                return f"{str_value[:4]}-{str_value[4:6]}-{str_value[6:8]}"
+            else:
+                return None
+
+        except Exception:
+            return None
+
+    def _safe_str(self, value) -> str:
+        """安全字符串转换"""
+        if value is None or str(value).lower() == "nan":
+            return ""
+        return str(value).strip()
 
     def get_fundamentals(
         self, symbol: str, report_date: Union[str, date], report_type: str = "Q4"
@@ -214,7 +375,7 @@ class AkShareAdapter(BaseDataSource):
             # 获取财务数据
             df = self._akshare.stock_financial_abstract_ths(symbol=ak_symbol)
 
-            return df
+            return self._convert_financial_data(df, symbol)
 
         return self._retry_request(_fetch_data)
 
@@ -239,9 +400,12 @@ class AkShareAdapter(BaseDataSource):
                 if stock_data.empty:
                     raise DataSourceDataError(f"未获取到估值数据: {symbol}")
 
-                return self._convert_valuation_data(
-                    stock_data.iloc[0], symbol, trade_date
-                )
+                return {
+                    "success": True,
+                    "data": self._convert_valuation_data(
+                        stock_data.iloc[0], symbol, trade_date
+                    ),
+                }
 
             except Exception as e:
                 logger.error(f"AkShare获取估值数据失败 {symbol}: {e}")
@@ -274,6 +438,77 @@ class AkShareAdapter(BaseDataSource):
             * 100000000,  # 转换为元
             "source": "akshare",
         }
+
+    def _convert_daily_data(self, df, symbol: str) -> Dict[str, Any]:
+        """转换日线数据格式"""
+        if df is None or df.empty:
+            return {"success": False, "data": None, "error": "数据为空"}
+
+        try:
+            # 转换DataFrame为标准格式
+            records = []
+            for _, row in df.iterrows():
+                record = {
+                    "symbol": symbol,
+                    "date": str(row.get("日期", "")),
+                    "open": float(row.get("开盘", 0) or 0),
+                    "high": float(row.get("最高", 0) or 0),
+                    "low": float(row.get("最低", 0) or 0),
+                    "close": float(row.get("收盘", 0) or 0),
+                    "volume": float(row.get("成交量", 0) or 0),
+                    "amount": float(row.get("成交额", 0) or 0),
+                }
+
+                # 验证数据有效性
+                if (
+                    record["open"] > 0
+                    and record["high"] > 0
+                    and record["low"] > 0
+                    and record["close"] > 0
+                ):
+                    records.append(record)
+
+            return {"success": True, "data": records, "count": len(records)}
+
+        except Exception as e:
+            logger.error(f"转换日线数据失败: {e}")
+            return {"success": False, "data": None, "error": str(e)}
+
+    def _convert_financial_data(self, df, symbol: str) -> Dict[str, Any]:
+        """转换财务数据格式"""
+        if df is None or df.empty:
+            return {"success": False, "data": None, "error": "财务数据为空"}
+
+        try:
+            # 提取第一行数据（最新财务数据）
+            if len(df) > 0:
+                row = df.iloc[0]
+                financial_data = {
+                    "revenue": self._safe_float(row.get("营业收入", 0)),
+                    "net_profit": self._safe_float(row.get("净利润", 0)),
+                    "total_assets": self._safe_float(row.get("总资产", 0)),
+                    "operating_profit": self._safe_float(row.get("营业利润", 0)),
+                    "eps": self._safe_float(row.get("每股收益", 0)),
+                }
+
+                return {"success": True, "data": financial_data}
+            else:
+                return {"success": False, "data": None, "error": "无财务数据"}
+
+        except Exception as e:
+            logger.error(f"转换财务数据失败: {e}")
+            return {"success": False, "data": None, "error": str(e)}
+
+    def _safe_float(self, value, default=0.0):
+        """安全的浮点数转换"""
+        try:
+            import pandas as pd
+
+            if pd.isna(value) or value == "" or value is None:
+                return default
+            return float(value)
+        except (ValueError, TypeError):
+            return default
 
     def _convert_to_akshare_symbol(self, symbol: str) -> str:
         """转换为AkShare股票代码格式"""
