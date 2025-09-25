@@ -88,6 +88,68 @@ graph TD
     C --> I
 ```
 
+### 配置管理
+
+#### 数据源配置
+
+在 `config.yaml` 中配置各个数据源：
+
+```yaml
+# 数据源配置
+data_sources:
+  # 各数据源基本配置
+  akshare:
+    enabled: true
+    timeout: 10
+    retry_times: 3
+    retry_delay: 1
+    rate_limit: 100  # 每分钟请求数限制
+
+  baostock:
+    enabled: true
+    timeout: 15
+    retry_times: 3
+    retry_delay: 2
+    rate_limit: 200
+
+  qstock:
+    enabled: true
+    timeout: 10
+    retry_times: 3
+    retry_delay: 1
+    rate_limit: 150
+
+  # 数据源优先级配置（可选）
+  source_priorities:
+    # 自定义特定场景的优先级
+    "SZ_1d_ohlcv": ["baostock", "qstock", "akshare"]
+    "SS_5m_ohlcv": ["qstock", "baostock", "akshare"]
+
+  # 其他配置
+  max_retry_attempts: 3
+  retry_delay: 1
+  health_check_interval: 300
+```
+
+#### 运行时配置修改
+
+```python
+from simtradedata.config import Config
+
+# 创建配置对象
+config = Config()
+
+# 动态修改数据源优先级
+config.set('data_sources.source_priorities.SZ_1d_ohlcv',
+          ['baostock', 'akshare', 'qstock'])
+
+# 禁用某个数据源
+config.set('data_sources.qstock.enabled', False)
+
+# 调整超时时间
+config.set('data_sources.baostock.timeout', 30)
+```
+
 ## 🛠️ 开发环境搭建
 
 ### 环境要求
@@ -499,54 +561,219 @@ poetry run pytest tests/integration/
 
 ## 🔧 扩展开发
 
+### 数据源优先级配置
+
+SimTradeData支持多个数据源，并采用优先级机制来确保数据质量和稳定性。
+
+#### 当前数据源优先级（已优化）
+
+| 数据类型 | 第一优先级 | 第二优先级 | 第三优先级 |
+|---------|-----------|-----------|-----------|
+| OHLCV行情 | BaoStock | QStock | AkShare |
+| 股票信息 | BaoStock | QStock | AkShare |
+| 估值数据 | BaoStock | QStock | AkShare |
+| 财务数据 | BaoStock | - | AkShare |
+| 交易日历 | BaoStock | - | AkShare |
+| 除权除息 | BaoStock | - | - |
+
+#### 优先级设计原则
+
+1. **稳定性第一**: BaoStock数据质量高且稳定，作为首选
+2. **性能考量**: QStock性能优异，作为第二选择
+3. **备用保障**: AkShare作为最后备用，确保数据可用性
+
+#### 修改数据源优先级
+
+在 `simtradedata/data_sources/manager.py` 的 `get_source_priorities` 方法中：
+
+```python
+def get_source_priorities(self, market: str, frequency: str, data_type: str) -> List[str]:
+    """获取数据源优先级"""
+
+    # 从配置中获取优先级，或使用默认优先级
+    priority_config = self._get_config("source_priorities", {})
+    key = f"{market}_{frequency}_{data_type}"
+
+    if key in priority_config:
+        return priority_config[key]
+
+    # 默认优先级策略 - akshare优先级降到最低
+    if data_type == "ohlcv":
+        return ["baostock", "qstock", "akshare"]
+    elif data_type == "fundamentals":
+        return ["baostock", "akshare"]  # 财务数据只有这两个源
+    # ... 其他数据类型配置
+```
+
+#### 通过配置文件自定义优先级
+
+在 `config.yaml` 中添加：
+
+```yaml
+data_sources:
+  source_priorities:
+    # 自定义深圳市场日线OHLCV数据优先级
+    "SZ_1d_ohlcv": ["baostock", "akshare", "qstock"]
+    # 自定义上海市场分钟线数据优先级
+    "SS_5m_ohlcv": ["qstock", "baostock", "akshare"]
+```
+
+#### 数据源状态监控
+
+系统提供完整的数据源监控能力：
+
+```python
+from simtradedata.data_sources.manager import DataSourceManager
+from simtradedata.config import Config
+
+# 创建配置和数据源管理器
+config = Config()
+dsm = DataSourceManager(config=config)
+
+# 检查所有数据源的健康状态
+health_status = dsm.health_check()
+if isinstance(health_status, dict) and 'data' in health_status:
+    health_data = health_status['data']
+else:
+    health_data = health_status
+
+for source_name, status in health_data.items():
+    print(f"{source_name}: {status['status']} (连接: {status['connected']})")
+
+# 获取可用的数据源列表
+available_sources = dsm.get_available_sources()
+print(f"可用数据源: {available_sources}")
+
+# 获取系统状态概览
+system_status = dsm.get_status()
+if isinstance(system_status, dict) and 'data' in system_status:
+    status_data = system_status['data']
+else:
+    status_data = system_status
+
+print(f"总数据源: {status_data['total_sources']}")
+print(f"健康数据源: {status_data['healthy_sources']}")
+```
+
+#### 数据源故障处理
+
+当某个数据源不可用时，系统会自动使用下一优先级的数据源：
+
+```python
+# 获取数据时系统自动处理故障切换
+try:
+    result = dsm.get_daily_data('000001.SZ', '2024-01-01', '2024-01-31')
+    if result.get('success'):
+        # 检查实际使用的数据源
+        actual_source = result.get('source', '未知')
+        print(f"数据来源: {actual_source}")
+except Exception as e:
+    print(f"所有数据源都不可用: {e}")
+```
+
+#### 数据源配置最佳实践
+
+1. **定期监控**: 设置定期健康检查任务
+2. **日志记录**: 启用详细的数据源访问日志
+3. **性能监控**: 监控各数据源的响应时间和成功率
+4. **配置备份**: 确保至少有两个可用的数据源
+
 ### 添加新的数据源
 
 1. **创建数据源类**
 
 ```python
 # simtradedata/data_sources/custom_source.py
-from .base import DataSource
+from .base import BaseDataSource
 import pandas as pd
+from typing import Dict, List, Any
 
-class CustomDataSource(DataSource):
+class CustomDataSource(BaseDataSource):
     """自定义数据源"""
-    
-    def __init__(self, config):
+
+    def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.api_key = config.get('custom_source.api_key')
-    
+        self.api_key = config.get('api_key', '')
+        self.base_url = config.get('base_url', '')
+
     def get_daily_data(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
         """获取日线数据"""
         # 实现数据获取逻辑
         pass
-    
+
     def get_stock_list(self, market: str = None) -> pd.DataFrame:
         """获取股票列表"""
         # 实现股票列表获取逻辑
         pass
-    
-    def test_connection(self) -> bool:
-        """测试连接"""
-        # 实现连接测试逻辑
+
+    def is_connected(self) -> bool:
+        """检查连接状态"""
+        # 实现连接检查逻辑
+        return True
+
+    def connect(self):
+        """建立连接"""
+        # 实现连接逻辑
         pass
+
+    def disconnect(self):
+        """断开连接"""
+        # 实现断开连接逻辑
+        pass
+
+    def get_capabilities(self) -> Dict[str, Any]:
+        """获取数据源能力"""
+        return {
+            'name': 'custom',
+            'enabled': True,
+            'supports_daily': True,
+            'supports_minute': False,
+            'supported_markets': ['SZ', 'SS'],
+            'rate_limit': 100
+        }
 ```
 
 2. **注册数据源**
 
-```python
-# simtradedata/data_sources/__init__.py
-from .custom_source import CustomDataSource
+修改 `simtradedata/data_sources/manager.py` 中的 `_register_adapters` 方法：
 
-# 在DataSourceManager中注册
-def register_custom_sources(manager):
-    manager.register_source('custom', CustomDataSource)
+```python
+def _register_adapters(self):
+    """注册数据源适配器"""
+    from .custom_source import CustomDataSource
+
+    self.adapter_classes = {
+        "akshare": AkShareAdapter,
+        "baostock": BaoStockAdapter,
+        "qstock": QStockAdapter,
+        "custom": CustomDataSource,  # 添加自定义数据源
+    }
 ```
 
 3. **配置数据源**
 
+在 `config.yaml` 中添加配置：
+
+```yaml
+data_sources:
+  custom:
+    enabled: true
+    api_key: 'your_api_key'
+    base_url: 'https://api.example.com'
+    timeout: 10
+    retry_times: 3
+    rate_limit: 100
+```
+
+或通过代码配置：
+
 ```python
+from simtradedata.config import Config
+
+config = Config()
 config.set('data_sources.custom.enabled', True)
 config.set('data_sources.custom.api_key', 'your_api_key')
+config.set('data_sources.custom.base_url', 'https://api.example.com')
 ```
 
 ### 添加新的接口
