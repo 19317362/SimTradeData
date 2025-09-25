@@ -40,7 +40,7 @@ class TestIncrementalCalendarUpdate(BaseTestClass):
         ]
         for date_str, is_trading in test_dates:
             db_manager.execute(
-                "INSERT OR REPLACE INTO trading_calendar (date, market, is_trading_day) VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO trading_calendar (date, market, is_trading) VALUES (?, ?, ?)",
                 (date_str, "CN", is_trading),
             )
 

@@ -154,7 +154,7 @@ def analyze_data_completeness(symbol, start_date, end_date):
     """分析数据完整性"""
     # 获取交易日历
     trade_dates = bs.query_trade_dates(start_date, end_date)
-    expected_dates = [date for date in trade_dates if date.is_trading_day]
+    expected_dates = [date for date in trade_dates if date.is_trading]
     
     # 获取实际数据
     actual_data = get_daily_data(symbol, start_date, end_date)

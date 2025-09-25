@@ -980,7 +980,7 @@ class SyncManager(BaseManager):
             # 插入数据
             for record in calendar_data:
                 self.db_manager.execute(
-                    "INSERT OR REPLACE INTO trading_calendar (date, market, is_trading_day) VALUES (?, ?, ?)",
+                    "INSERT OR REPLACE INTO trading_calendar (date, market, is_trading) VALUES (?, ?, ?)",
                     (
                         record.get("trade_date", record.get("date")),
                         "CN",
