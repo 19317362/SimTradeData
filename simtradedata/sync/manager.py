@@ -1862,9 +1862,17 @@ class SyncManager(BaseManager):
                 baostock_source = self.data_source_manager.sources.get("baostock")
                 if baostock_source and baostock_source.is_connected():
                     try:
-                        valuation_records = baostock_source.get_valuation_data(
+                        valuation_data = baostock_source.get_valuation_data(
                             symbol, str(target_date)
                         )
+
+                        # BaoStock返回单个字典，转换为列表以统一处理
+                        if valuation_data and isinstance(valuation_data, dict):
+                            valuation_records = [valuation_data]
+                        elif valuation_data and isinstance(valuation_data, list):
+                            valuation_records = valuation_data
+                        else:
+                            valuation_records = []
 
                         if valuation_records:
                             for record in valuation_records:
@@ -1882,8 +1890,8 @@ class SyncManager(BaseManager):
                                 if existing and existing["count"] == 0:
                                     self.db_manager.execute(
                                         """INSERT INTO valuations
-                                        (symbol, date, pe_ratio, pb_ratio, ps_ratio, pcf_ratio, source)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                        (symbol, date, pe_ratio, pb_ratio, ps_ratio, pcf_ratio, market_cap, circulating_cap, source)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                                         (
                                             symbol,
                                             record_date,
@@ -1891,6 +1899,8 @@ class SyncManager(BaseManager):
                                             record.get("pb_ratio"),
                                             record.get("ps_ratio"),
                                             record.get("pcf_ratio"),
+                                            record.get("market_cap"),
+                                            record.get("circulating_cap"),
                                             record.get("source", ""),
                                         ),
                                     )

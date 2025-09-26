@@ -511,7 +511,7 @@ class BaoStockAdapter(BaseDataSource):
         symbol: str,
         trade_date: Union[str, date],
     ) -> Dict[str, Any]:
-        """获取估值数据（从K线数据中提取）"""
+        """获取估值数据（从K线数据中提取，并计算市值）"""
         if not self.is_connected():
             self.connect()
 
@@ -541,9 +541,15 @@ class BaoStockAdapter(BaseDataSource):
                 # 清理DataFrame中的空字符串
                 df = df.replace("", None)
 
-                # 取最新一条记录并转换
+                # 取最新一条记录
                 latest = df.iloc[-1]
-                return self._convert_valuation_data(latest, symbol, trade_date)
+
+                # 获取股本数据用于计算市值
+                share_data = self._get_share_data(bs_symbol, trade_date)
+
+                return self._convert_valuation_data(
+                    latest, symbol, trade_date, share_data
+                )
 
             except Exception as e:
                 logger.error(f"BaoStock获取估值数据失败 {symbol}: {e}")
@@ -551,8 +557,96 @@ class BaoStockAdapter(BaseDataSource):
 
         return self._retry_request(_fetch_data)
 
+    def _get_share_data(self, bs_symbol: str, trade_date: str) -> Dict[str, float]:
+        """获取股本数据用于市值计算"""
+        try:
+            # 从trade_date提取年份和季度
+            from datetime import datetime
+
+            trade_dt = datetime.strptime(trade_date, "%Y-%m-%d")
+            year = str(trade_dt.year)
+
+            # 根据月份确定季度
+            month = trade_dt.month
+            if month <= 3:
+                quarter = "1"
+            elif month <= 6:
+                quarter = "2"
+            elif month <= 9:
+                quarter = "3"
+            else:
+                quarter = "4"
+
+            # 获取利润表数据（包含股本信息）
+            rs = self._baostock.query_profit_data(
+                code=bs_symbol, year=year, quarter=quarter
+            )
+
+            if rs.error_code == "0":
+                df = rs.get_data()
+                if not df.empty:
+                    row = df.iloc[0]
+                    total_share = row.get("totalShare", 0)
+                    liqa_share = row.get("liqaShare", 0)
+
+                    # 转换为浮点数，BaoStock返回的是字符串
+                    try:
+                        total_share = (
+                            float(total_share)
+                            if total_share and str(total_share) != ""
+                            else 0
+                        )
+                        liqa_share = (
+                            float(liqa_share)
+                            if liqa_share and str(liqa_share) != ""
+                            else 0
+                        )
+                    except (ValueError, TypeError):
+                        total_share = liqa_share = 0
+
+                    return {"total_share": total_share, "liqa_share": liqa_share}
+
+            # 如果获取不到当前季度数据，尝试上一季度
+            if quarter == "1":
+                year = str(trade_dt.year - 1)
+                quarter = "4"
+            else:
+                quarter = str(int(quarter) - 1)
+
+            rs = self._baostock.query_profit_data(
+                code=bs_symbol, year=year, quarter=quarter
+            )
+
+            if rs.error_code == "0":
+                df = rs.get_data()
+                if not df.empty:
+                    row = df.iloc[0]
+                    total_share = row.get("totalShare", 0)
+                    liqa_share = row.get("liqaShare", 0)
+
+                    try:
+                        total_share = (
+                            float(total_share)
+                            if total_share and str(total_share) != ""
+                            else 0
+                        )
+                        liqa_share = (
+                            float(liqa_share)
+                            if liqa_share and str(liqa_share) != ""
+                            else 0
+                        )
+                    except (ValueError, TypeError):
+                        total_share = liqa_share = 0
+
+                    return {"total_share": total_share, "liqa_share": liqa_share}
+
+        except Exception as e:
+            logger.warning(f"获取股本数据失败 {bs_symbol}: {e}")
+
+        return {"total_share": 0, "liqa_share": 0}
+
     def _convert_valuation_data(
-        self, data, symbol: str, trade_date: str
+        self, data, symbol: str, trade_date: str, share_data: Dict[str, float] = None
     ) -> Dict[str, Any]:
         """转换估值数据格式"""
 
@@ -565,6 +659,24 @@ class BaoStockAdapter(BaseDataSource):
             except (ValueError, TypeError):
                 return default
 
+        # 获取收盘价用于计算市值
+        close_price = safe_float(data.get("close", 0))
+
+        # 计算市值（如果有股本数据和收盘价）
+        market_cap = 0
+        circulating_cap = 0
+
+        if share_data and close_price > 0:
+            total_share = share_data.get("total_share", 0)
+            liqa_share = share_data.get("liqa_share", 0)
+
+            if total_share > 0:
+                market_cap = total_share * close_price  # 总市值 = 总股本 × 收盘价
+            if liqa_share > 0:
+                circulating_cap = (
+                    liqa_share * close_price
+                )  # 流通市值 = 流通股本 × 收盘价
+
         return {
             "symbol": symbol,
             "date": str(trade_date),
@@ -572,8 +684,8 @@ class BaoStockAdapter(BaseDataSource):
             "pb_ratio": safe_float(data.get("pbMRQ", 0)),
             "ps_ratio": safe_float(data.get("psTTM", 0)),
             "pcf_ratio": safe_float(data.get("pcfNcfTTM", 0)),
-            "market_cap": 0,  # BaoStock K线数据中没有市值，需要单独计算
-            "circulating_cap": 0,  # BaoStock K线数据中没有流通市值
+            "market_cap": market_cap,  # 计算得出的总市值
+            "circulating_cap": circulating_cap,  # 计算得出的流通市值
             "source": "baostock",
         }
 
