@@ -34,13 +34,13 @@ PRODUCTION_CONFIG = {
     },
     # 数据源配置 - 生产环境优化
     "data_sources": {
-        "akshare": {
+        "mootdx": {
             "enabled": True,
+            "tdx_dir": "C:/new_tdx",
+            "use_online": True,
+            "market": "std",
             "timeout": 30,  # 增加超时
-            "retry_times": 5,  # 增加重试
-            "retry_delay": 3,  # 增加延迟
-            "rate_limit": 150,  # 限制请求频率
-            "connection_pool_size": 10,  # 连接池大小
+            "rate_limit": 300,  # 限制请求频率
         },
         "baostock": {
             "enabled": True,

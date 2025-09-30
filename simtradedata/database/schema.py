@@ -231,7 +231,7 @@ DATABASE_SCHEMA = {
     "data_sources": """
         CREATE TABLE data_sources (
             name TEXT PRIMARY KEY,               -- 数据源名称
-            type TEXT NOT NULL,                  -- akshare/baostock/qstock
+            type TEXT NOT NULL,                  -- mootdx/baostock/qstock
             
             -- 配置
             enabled BOOLEAN DEFAULT TRUE,
@@ -468,15 +468,15 @@ def _initialize_data_sources(conn):
             '["1d"]',  # BaoStock只支持日线
         ),
         (
-            "akshare",  # 优先级2: 功能全面但不稳定
-            "akshare",
+            "mootdx",  # 优先级2: 基于通达信，稳定可靠
+            "mootdx",
             True,
             2,
-            60,
+            300,
             True,
             True,
             True,
-            '["SZ","SS","HK","US"]',
+            '["SZ","SS"]',
             '["1d","5m","15m","30m","60m"]',
         ),
         (

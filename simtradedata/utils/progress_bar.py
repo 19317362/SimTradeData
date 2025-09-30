@@ -36,7 +36,7 @@ class SyncProgressBar:
                 "simtradedata.sync.incremental",
                 "simtradedata.data_sources.manager",
                 "simtradedata.data_sources.baostock_adapter",
-                "simtradedata.data_sources.akshare_adapter",
+                "simtradedata.data_sources.mootdx_adapter",
                 "simtradedata.core.logging_mixin",
                 "simtradedata.config.manager",
                 "simtradedata.database.manager",

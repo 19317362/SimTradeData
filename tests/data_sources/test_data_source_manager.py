@@ -49,7 +49,7 @@ class TestDataSourceManager:
     def config(self):
         """创建测试配置"""
         cfg = Config()
-        cfg.set("data_sources.akshare.enabled", True)
+        cfg.set("data_sources.mootdx.enabled", True)
         cfg.set("data_sources.baostock.enabled", True)
         cfg.set("data_sources.qstock.enabled", True)
         return cfg
@@ -77,7 +77,7 @@ class TestDataSourceManager:
     def test_adapter_registration(self, manager):
         """测试适配器注册"""
         assert hasattr(manager, "adapter_classes")
-        assert "akshare" in manager.adapter_classes
+        assert "mootdx" in manager.adapter_classes
         assert "baostock" in manager.adapter_classes
         assert "qstock" in manager.adapter_classes
 
@@ -246,13 +246,13 @@ class TestDataSourceManagerConfiguration:
     def test_source_specific_config(self):
         """测试数据源特定配置"""
         config = Config()
-        config.set("data_sources.akshare.enabled", True)
-        config.set("data_sources.akshare.timeout", 20)
+        config.set("data_sources.mootdx.enabled", True)
+        config.set("data_sources.mootdx.timeout", 20)
 
         manager = DataSourceManager(config=config)
 
-        if "akshare" in manager.sources:
-            source = manager.sources["akshare"]
+        if "mootdx" in manager.sources:
+            source = manager.sources["mootdx"]
             # 配置应该被正确传递到适配器
             assert hasattr(source, "timeout")
 
@@ -274,7 +274,7 @@ class TestDataSourceManagerErrorScenarios:
         """测试无数据源情况"""
         config = Config()
         # 禁用所有数据源
-        config.set("data_sources.akshare.enabled", False)
+        config.set("data_sources.mootdx.enabled", False)
         config.set("data_sources.baostock.enabled", False)
         config.set("data_sources.qstock.enabled", False)
 
@@ -288,7 +288,7 @@ class TestDataSourceManagerErrorScenarios:
     def test_health_check_with_no_sources(self):
         """测试无数据源时的健康检查"""
         config = Config()
-        config.set("data_sources.akshare.enabled", False)
+        config.set("data_sources.mootdx.enabled", False)
         config.set("data_sources.baostock.enabled", False)
         config.set("data_sources.qstock.enabled", False)
 

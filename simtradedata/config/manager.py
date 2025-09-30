@@ -172,7 +172,7 @@ class Config(BaseManager):
             "PTRADE_LOG_LEVEL": ("logging", "level"),
             "PTRADE_SYNC_ENABLED": ("sync", "enabled"),
             "PTRADE_SYNC_SCHEDULE": ("sync", "daily_schedule"),
-            "PTRADE_AKSHARE_ENABLED": ("data_sources", "akshare", "enabled"),
+            "PTRADE_MOOTDX_ENABLED": ("data_sources", "mootdx", "enabled"),
             "PTRADE_BAOSTOCK_ENABLED": ("data_sources", "baostock", "enabled"),
             "PTRADE_QSTOCK_ENABLED": ("data_sources", "qstock", "enabled"),
         }
@@ -250,7 +250,7 @@ class Config(BaseManager):
                 raise ValueError(f"市场 {market} 缺少配置")
 
         # 验证数据源配置
-        for source in ["akshare", "baostock", "qstock"]:
+        for source in ["mootdx", "baostock", "qstock"]:
             if not self._has_nested_key(("data_sources", source)):
                 logger.warning(f"数据源 {source} 缺少配置")
 

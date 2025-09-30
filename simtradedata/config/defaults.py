@@ -55,12 +55,15 @@ DEFAULT_CONFIG = {
     },
     # 数据源配置
     "data_sources": {
-        "akshare": {
+        "mootdx": {
             "enabled": True,
+            "tdx_dir": "C:/new_tdx",
+            "use_online": True,
+            "market": "std",
             "timeout": 10,
             "retry_times": 3,
             "retry_delay": 1,
-            "rate_limit": 100,  # 每分钟请求数限制
+            "rate_limit": 300,  # 每分钟请求数限制
         },
         "baostock": {
             "enabled": True,
@@ -177,7 +180,7 @@ def get_data_source_config(source: str) -> Dict[str, Any]:
     获取指定数据源的配置
 
     Args:
-        source: 数据源名称 (akshare/baostock/qstock)
+        source: 数据源名称 (mootdx/baostock/qstock)
 
     Returns:
         Dict[str, Any]: 数据源配置

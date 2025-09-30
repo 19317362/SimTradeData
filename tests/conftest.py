@@ -26,7 +26,7 @@ class BaseTestClass:
         """配置对象fixture"""
         config = Config()
         # 测试环境使用baostock作为优先数据源，因为它支持交易日历查询
-        config.set("data_sources.priority", ["baostock", "qstock", "akshare"])
+        config.set("data_sources.priority", ["baostock", "qstock", "mootdx"])
         return config
 
     @pytest.fixture
@@ -172,11 +172,12 @@ class BaseTestClass:
         # 插入测试数据源配置（优先使用baostock，它支持交易日历）
         db_manager.execute(
             """
-            INSERT OR REPLACE INTO data_sources (name, type, priority, supports_history, markets, frequencies, status)
+            INSERT OR REPLACE INTO data_sources
+            (name, type, enabled, priority, rate_limit, supports_realtime, supports_history, supports_financials, markets, frequencies, status)
             VALUES
-                ('baostock', 'baostock', 1, 1, '["SZ","SS"]', '["1d"]', 'active'),
-                ('qstock', 'qstock', 2, 1, '["SZ","SS"]', '["1d","5m","15m","30m","1h"]', 'active'),
-                ('akshare', 'akshare', 3, 1, '["SZ","SS"]', '["1d"]', 'active')
+                ('baostock', 'baostock', 1, 1, 120, 0, 1, 1, '["SZ","SS"]', '["1d"]', 'active'),
+                ('mootdx', 'mootdx', 1, 2, 300, 1, 1, 1, '["SZ","SS"]', '["1d","5m","15m","30m","60m"]', 'active'),
+                ('qstock', 'qstock', 1, 3, 100, 0, 1, 0, '["SZ","SS"]', '["1d","5m","15m","30m","1h"]', 'active')
         """
         )
 

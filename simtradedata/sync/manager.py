@@ -1133,7 +1133,7 @@ class SyncManager(BaseManager):
                     if stock_info["success"]:
                         stock_info = stock_info["data"]
                         self.logger.info(
-                            f"成功解包AkShare格式，数据类型: {type(stock_info)}"
+                            f"成功解包数据源格式，数据类型: {type(stock_info)}"
                         )
                     else:
                         error_msg = stock_info.get("error", "未知错误")
@@ -1831,7 +1831,7 @@ class SyncManager(BaseManager):
                 except Exception as e:
                     self.logger.debug(f"BaoStock获取财务数据失败: {symbol} - {e}")
 
-                # 如果BaoStock失败，尝试AkShare作为后备
+                # 如果BaoStock失败，尝试mootdx作为后备
                 if not financial_success:
                     try:
                         financial_data = self.data_source_manager.get_fundamentals(
@@ -1846,16 +1846,16 @@ class SyncManager(BaseManager):
                             financial_data
                         ):
                             self._insert_financial_data(
-                                financial_data, symbol, report_date_str, "akshare"
+                                financial_data, symbol, report_date_str, "mootdx"
                             )
                             result["financials_count"] += 1
                             financial_success = True
-                            self.logger.debug(f"AkShare财务数据插入成功: {symbol}")
+                            self.logger.debug(f"mootdx财务数据插入成功: {symbol}")
                         else:
-                            self.logger.debug(f"AkShare财务数据无效: {symbol}")
+                            self.logger.debug(f"mootdx财务数据无效: {symbol}")
 
                     except Exception as e:
-                        self.logger.warning(f"AkShare获取财务数据失败: {symbol} - {e}")
+                        self.logger.warning(f"mootdx获取财务数据失败: {symbol} - {e}")
             else:
                 self.logger.warning(f"跳过无效报告期: {symbol} {report_date_str}")
 
@@ -1933,12 +1933,12 @@ class SyncManager(BaseManager):
                                 str(target_date),
                                 valuation_data.get("pe_ratio", None),
                                 valuation_data.get("pb_ratio", None),
-                                "akshare",
+                                "mootdx",
                             ),
                         )
                         result["valuations_count"] += 1
                         valuation_success = True
-                        self.logger.debug(f"AkShare估值数据插入成功: {symbol}")
+                        self.logger.debug(f"mootdx估值数据插入成功: {symbol}")
                     else:
                         self.logger.debug(f"估值数据无效，跳过: {symbol}")
 

@@ -13,9 +13,9 @@ from typing import Any, Dict, List, Optional, Union
 # 项目内导入
 from ..config import Config
 from ..core import BaseManager, ValidationError, unified_error_handler
-from .akshare_adapter import AkShareAdapter
 from .baostock_adapter import BaoStockAdapter
 from .base import BaseDataSource
+from .mootdx_adapter import MootdxAdapter
 from .qstock_adapter import QStockAdapter
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ class DataSourceManager(BaseManager):
     def _register_adapters(self):
         """注册数据源适配器"""
         self.adapter_classes = {
-            "akshare": AkShareAdapter,
+            "mootdx": MootdxAdapter,
             "baostock": BaoStockAdapter,
             "qstock": QStockAdapter,
         }
@@ -72,7 +72,7 @@ class DataSourceManager(BaseManager):
         """初始化数据源"""
         # 由于设置了config_prefix为"data_sources"，直接获取各个数据源配置
         data_sources_config = {
-            "akshare": self._get_config("akshare", {}),
+            "mootdx": self._get_config("mootdx", {}),
             "baostock": self._get_config("baostock", {}),
             "qstock": self._get_config("qstock", {}),
         }
@@ -635,8 +635,8 @@ class DataSourceManager(BaseManager):
         if symbol and market is None:
             market = self._parse_market_from_symbol(symbol)
 
-        # 概念数据主要从AKShare获取
-        priorities = ["akshare"]
+        # 概念数据主要从mootdx获取
+        priorities = ["mootdx"]
 
         for source_name in priorities:
             if source_name not in self.sources:

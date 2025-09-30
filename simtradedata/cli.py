@@ -452,7 +452,7 @@ def main():
         for module_name in [
             "simtradedata.preprocessor.engine",
             "simtradedata.data_sources.baostock_adapter",
-            "simtradedata.data_sources.akshare_adapter",
+            "simtradedata.data_sources.mootdx_adapter",
             "simtradedata.data_sources.manager",
             "simtradedata.sync.incremental",
         ]:

@@ -46,20 +46,23 @@ markets:
 
 # 数据源配置
 data_sources:
-  akshare:
+  mootdx:
     enabled: true
+    tdx_dir: "C:/new_tdx"  # 通达信安装目录
+    use_online: true        # 是否使用在线接口
+    market: "std"           # std=标准市场, ext=扩展市场
     timeout: 10
     retry_times: 3
     retry_delay: 1
-    rate_limit: 100  # 每分钟请求数限制
-  
+    rate_limit: 300         # 每分钟请求数限制
+
   baostock:
     enabled: true
     timeout: 15
     retry_times: 3
     retry_delay: 2
     rate_limit: 200
-  
+
   qstock:
     enabled: true
     timeout: 10
