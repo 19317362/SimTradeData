@@ -4,7 +4,7 @@
 测试过期状态清理逻辑（断点续传的关键部分）
 """
 
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -33,8 +33,8 @@ class TestStatusCleanup(BaseTestClass):
             "DELETE FROM extended_sync_status WHERE symbol = ?", (symbol,)
         )
 
-        # 场景：插入超过 1 天的 pending 状态记录
-        expired_time = datetime.now() - timedelta(days=2)
+        # 场景：插入超过 1 天的 pending 状态记录（使用 UTC 时间）
+        expired_time = datetime.now(UTC) - timedelta(days=2)
         db_manager.execute(
             """
             INSERT INTO extended_sync_status
@@ -93,8 +93,8 @@ class TestStatusCleanup(BaseTestClass):
             "DELETE FROM extended_sync_status WHERE symbol = ?", (symbol,)
         )
 
-        # 场景：插入最近的 pending 状态记录（12 小时前）
-        recent_time = datetime.now() - timedelta(hours=12)
+        # 场景：插入最近的 pending 状态记录（12 小时前，使用 UTC 时间）
+        recent_time = datetime.now(UTC) - timedelta(hours=12)
         db_manager.execute(
             """
             INSERT INTO extended_sync_status
@@ -139,7 +139,7 @@ class TestStatusCleanup(BaseTestClass):
         )
 
         target_date = date(2025, 1, 24)
-        expired_time = datetime.now() - timedelta(days=2)
+        expired_time = datetime.now(UTC) - timedelta(days=2)
 
         # 准备测试数据：不同状态的过期记录
         test_cases = [
@@ -214,8 +214,8 @@ class TestStatusCleanup(BaseTestClass):
             "DELETE FROM extended_sync_status WHERE symbol = ?", (symbol,)
         )
 
-        # 场景：插入明确超过 1 天的记录（使用 2 天前确保稳定）
-        expired_time = datetime.now() - timedelta(days=2)
+        # 场景：插入明确超过 1 天的记录（使用 2 天前确保稳定，UTC 时间）
+        expired_time = datetime.now(UTC) - timedelta(days=2)
         db_manager.execute(
             """
             INSERT INTO extended_sync_status

@@ -99,7 +99,7 @@ class DataQualityValidator:
         return has_pe or has_pb or has_ps or has_pcf
 
     @staticmethod
-    def is_valid_report_date(report_date: str, symbol: Optional[str] = None) -> bool:
+    def is_valid_report_date(report_date: str) -> bool:
         """验证报告期有效性"""
         try:
             report_dt = datetime.strptime(report_date, SyncConstants.DATE_FORMAT)
@@ -116,19 +116,6 @@ class DataQualityValidator:
             return True
         except (ValueError, TypeError):
             return False
-
-    @staticmethod
-    def is_valid_stock_basic_info(data: Dict[str, Any]) -> bool:
-        """验证股票基础信息有效性"""
-        if not data or not isinstance(data, dict):
-            return False
-
-        # 检查关键字段
-        symbol = data.get("symbol", "")
-        name = data.get("name", "")
-        market = data.get("market", "")
-
-        return bool(symbol and name and market)
 
 
 class SyncManager(BaseManager):
@@ -221,9 +208,9 @@ class SyncManager(BaseManager):
             if data.get("success"):
                 return data.get("data")
             else:
-                # 失败响应，记录错误并返回None
+                # 失败响应（标准响应格式），记录为DEBUG级别
                 error_msg = data.get("error", "未知错误")
-                self.logger.warning(f"数据源返回失败: {error_msg}")
+                self.logger.debug(f"数据源返回标准失败响应: {error_msg}")
                 return None
 
         # 如果是简单包装格式 {"data": ...} (没有success字段)
@@ -365,6 +352,7 @@ class SyncManager(BaseManager):
 
                     # 阶段2: 同步扩展数据（断点续传）
                     log_phase_start("阶段2", "扩展数据同步（断点续传）")
+                    phase2_resume_start = datetime.now()
 
                     with create_phase_progress(
                         "phase2",
@@ -390,6 +378,23 @@ class SyncManager(BaseManager):
                                     "处理股票": f"{extended_result.get('processed_symbols', 0)}只",
                                 },
                             )
+
+                            # 记录阶段2性能（断点续传）
+                            phase2_resume_duration = (
+                                datetime.now() - phase2_resume_start
+                            ).total_seconds()
+                            self._log_performance(
+                                "扩展数据同步（断点续传）",
+                                phase2_resume_duration,
+                                stocks=len(extended_symbols_to_process),
+                            )
+                            if "extended_data_sync" in full_result["phases"]:
+                                if isinstance(
+                                    full_result["phases"]["extended_data_sync"], dict
+                                ):
+                                    full_result["phases"]["extended_data_sync"][
+                                        "duration_seconds"
+                                    ] = phase2_resume_duration
 
                             # 完成时间
                             end_time = datetime.now()
@@ -417,6 +422,7 @@ class SyncManager(BaseManager):
 
             # 阶段0: 更新基础数据（交易日历和股票列表）
             log_phase_start("阶段0", "更新基础数据")
+            phase0_start = datetime.now()
 
             with create_phase_progress("phase0", 2, "基础数据更新", "项") as pbar:
                 try:
@@ -478,6 +484,20 @@ class SyncManager(BaseManager):
                     full_result["summary"]["total_phases"] += 1
                     full_result["summary"]["failed_phases"] += 1
 
+            # 记录阶段0性能
+            phase0_duration = (datetime.now() - phase0_start).total_seconds()
+            self._log_performance("基础数据更新", phase0_duration)
+            if "base_data_update" in full_result["phases"]:
+                full_result["phases"]["base_data_update"][
+                    "duration_seconds"
+                ] = phase0_duration
+            else:
+                # 如果没有base_data_update，在calendar_update中添加
+                if "calendar_update" in full_result["phases"]:
+                    full_result["phases"]["calendar_update"][
+                        "duration_seconds"
+                    ] = phase0_duration
+
             # 如果没有指定股票列表，从数据库获取活跃股票（完整流程需要）
             if not symbols:
                 symbols = self._get_active_stocks_from_db()
@@ -490,6 +510,7 @@ class SyncManager(BaseManager):
 
             # 阶段1: 增量同步（市场数据）
             log_phase_start("阶段1", "增量同步市场数据")
+            phase1_start = datetime.now()
 
             with create_phase_progress(
                 "phase1", len(symbols), "增量同步", "股票"
@@ -521,10 +542,20 @@ class SyncManager(BaseManager):
                     }
                     full_result["summary"]["failed_phases"] += 1
 
+            # 记录阶段1性能
+            phase1_duration = (datetime.now() - phase1_start).total_seconds()
+            self._log_performance("增量同步", phase1_duration, stocks=len(symbols))
+            if "incremental_sync" in full_result["phases"]:
+                if isinstance(full_result["phases"]["incremental_sync"], dict):
+                    full_result["phases"]["incremental_sync"][
+                        "duration_seconds"
+                    ] = phase1_duration
+
             full_result["summary"]["total_phases"] += 1
 
             # 阶段2: 同步扩展数据
             log_phase_start("阶段2", "同步扩展数据")
+            phase2_start = datetime.now()
 
             # 预检查扩展数据同步的断点续传状态
             extended_symbols_to_process = self._get_extended_data_symbols_to_process(
@@ -584,21 +615,33 @@ class SyncManager(BaseManager):
                         }
                         full_result["summary"]["failed_phases"] += 1
 
+            # 记录阶段2性能
+            phase2_duration = (datetime.now() - phase2_start).total_seconds()
+            self._log_performance(
+                "扩展数据同步", phase2_duration, stocks=len(extended_symbols_to_process)
+            )
+            if "extended_data_sync" in full_result["phases"]:
+                if isinstance(full_result["phases"]["extended_data_sync"], dict):
+                    full_result["phases"]["extended_data_sync"][
+                        "duration_seconds"
+                    ] = phase2_duration
+
             full_result["summary"]["total_phases"] += 1
 
             # 阶段3: 缺口检测
             log_phase_start("阶段3", "缺口检测与修复")
+            phase3_start = datetime.now()
 
             with create_phase_progress(
-                "phase2", len(symbols), "缺口检测", "股票"
+                "phase3", len(symbols), "缺口检测", "股票"
             ) as pbar:
                 try:
+                    update_phase_description(f"检测 {len(symbols)} 只股票的缺口")
                     gap_start_date = target_date - timedelta(days=30)  # 检测最近30天
                     gap_result = self.gap_detector.detect_all_gaps(
                         gap_start_date, target_date, symbols, frequencies
                     )
 
-                    # 更新进度
                     # 更新进度
                     if pbar is not None:
                         pbar.update(len(symbols))
@@ -634,16 +677,31 @@ class SyncManager(BaseManager):
                     }
                     full_result["summary"]["failed_phases"] += 1
 
+            # 记录阶段3性能
+            phase3_duration = (datetime.now() - phase3_start).total_seconds()
+            self._log_performance(
+                "缺口检测与修复", phase3_duration, stocks=len(symbols)
+            )
+            if "gap_detection" in full_result["phases"]:
+                if isinstance(full_result["phases"]["gap_detection"], dict):
+                    full_result["phases"]["gap_detection"][
+                        "duration_seconds"
+                    ] = phase3_duration
+
             full_result["summary"]["total_phases"] += 1
 
-            # 阶段3: 数据验证
+            # 阶段4: 数据验证
             if self.enable_validation:
-                log_phase_start("阶段3", "数据验证")
+                log_phase_start("阶段4", "数据验证")
+                phase4_start = datetime.now()
 
                 with create_phase_progress(
-                    "phase3", len(symbols), "数据验证", "股票"
+                    "phase4", len(symbols), "数据验证", "股票"
                 ) as pbar:
                     try:
+                        update_phase_description(
+                            f"验证 {len(symbols)} 只股票的数据质量"
+                        )
                         validation_start_date = target_date - timedelta(
                             days=7
                         )  # 验证最近7天
@@ -682,6 +740,15 @@ class SyncManager(BaseManager):
                             "error": str(e),
                         }
                         full_result["summary"]["failed_phases"] += 1
+
+                # 记录阶段4性能
+                phase4_duration = (datetime.now() - phase4_start).total_seconds()
+                self._log_performance("数据验证", phase4_duration, stocks=len(symbols))
+                if "validation" in full_result["phases"]:
+                    if isinstance(full_result["phases"]["validation"], dict):
+                        full_result["phases"]["validation"][
+                            "duration_seconds"
+                        ] = phase4_duration
 
                 full_result["summary"]["total_phases"] += 1
 
@@ -782,15 +849,21 @@ class SyncManager(BaseManager):
             if not symbols:
                 return []
 
-            # 清理过期的pending状态
-            cleanup_count = self.db_manager.execute(
+            # 清理过期的pending状态（使用 UTC 时间确保一致性）
+            from datetime import UTC, datetime, timedelta
+
+            cleanup_threshold = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+            cursor = self.db_manager.execute(
                 """
-                DELETE FROM extended_sync_status 
-                WHERE target_date = ? AND status = 'pending' 
-                AND created_at < datetime('now', '-1 day')
+                DELETE FROM extended_sync_status
+                WHERE target_date = ? AND status = 'pending'
+                AND created_at < ?
                 """,
-                (str(target_date),),
+                (str(target_date), cleanup_threshold),
             )
+            cleanup_count = cursor.rowcount
+            if cleanup_count > 0:
+                self.logger.debug(f"清理了 {cleanup_count} 条过期 pending 状态记录")
 
             # 智能数据完整性检查：使用灵活的日期范围
             # 财务数据：检查最近2年的年报数据
@@ -1665,7 +1738,26 @@ class SyncManager(BaseManager):
         self.logger.info(f"  - 需要处理: {len(symbols)}")
         self.logger.info(f"  - 待处理阈值: {batch_threshold}")
         self.logger.info(f"  - 总库存阈值: {total_threshold}")
-        self.logger.info(f"  - 批量模式: {should_use_batch}")
+        self.logger.info(
+            f"  - 决策结果: {'✅ 启用批量模式' if should_use_batch else '⛔ 使用逐个模式'}"
+        )
+
+        # 记录决策理由
+        if should_use_batch:
+            reason = []
+            if len(symbols) >= batch_threshold:
+                reason.append(
+                    f"待处理股票({len(symbols)})达到批量阈值({batch_threshold})"
+                )
+            if total_stocks >= total_threshold:
+                reason.append(
+                    f"数据库总股票({total_stocks})达到总库存阈值({total_threshold})"
+                )
+            self.logger.info(f"  - 决策理由: {'; '.join(reason)}")
+        else:
+            self.logger.info(
+                f"  - 决策理由: 未达到批量模式阈值，使用逐个模式以减少资源消耗"
+            )
 
         financial_data_map = {}  # symbol -> financial_data
 
@@ -1771,18 +1863,27 @@ class SyncManager(BaseManager):
                             flush=True,
                         )
                 else:
-                    self.logger.warning(f"批量导入失败，将回退到逐个查询模式")
+                    self.logger.info(
+                        "⚠️  批量导入失败：未获取到有效数据，将回退到逐个查询模式"
+                    )
                     print(f"⚠️  批量导入失败，将回退到逐个查询模式", flush=True)
                     result["batch_mode"] = False
 
             except Exception as e:
-                self.logger.error(f"批量导入财务数据失败: {e}")
+                self.logger.error(f"批量导入财务数据异常: {e}")
                 print(f"❌ 批量导入财务数据失败: {e}", flush=True)
-                self.logger.warning("将回退到逐个查询模式")
+                self.logger.info("⚠️  批量导入异常，将回退到逐个查询模式")
                 result["batch_mode"] = False
 
         # 处理每只股票的扩展数据
-        self.logger.debug(f"开始逐只处理股票，批量模式: {result.get('batch_mode')}")
+        batch_mode_enabled = result.get("batch_mode", False)
+        if batch_mode_enabled:
+            self.logger.info(
+                f"🚀 开始处理 {len(symbols)} 只股票（批量模式：使用预加载的财务数据）"
+            )
+        else:
+            self.logger.info(f"🚀 开始处理 {len(symbols)} 只股票（逐个模式）")
+
         for i, symbol in enumerate(symbols):
             self.logger.debug(f"处理 {symbol} ({i+1}/{len(symbols)})")
 
@@ -1934,7 +2035,7 @@ class SyncManager(BaseManager):
                 report_date_str = f"{report_year}-12-31"
 
                 # 验证报告期有效性
-                if DataQualityValidator.is_valid_report_date(report_date_str, symbol):
+                if DataQualityValidator.is_valid_report_date(report_date_str):
                     try:
                         # 🚀 优化: 优先使用预加载的财务数据（批量模式）
                         if preloaded_financial and preloaded_financial.get("data"):
