@@ -96,7 +96,16 @@ class SimTradeDataCLI:
             )
 
             # 输出结果
-            summary = result.get("summary", {})
+            # unified_error_handler会包装结果为 {"success": True, "data": {...}}
+            if result.get("success"):
+                summary = result.get("data", {}).get("summary", {})
+            else:
+                summary = (
+                    result.get("data", {}).get("summary", {})
+                    if result.get("data")
+                    else {}
+                )
+
             logger.info(f"✅ 全量同步完成!")
             logger.info(f"   成功阶段: {summary.get('successful_phases', 0)}")
             logger.info(f"   失败阶段: {summary.get('failed_phases', 0)}")
@@ -480,7 +489,11 @@ def main():
         elif args.command == "status":
             success = cli.status()
 
-        return 0 if success else 1
+        # 使用os._exit()强制退出，跳过所有清理和析构函数
+        # 这样可以避免qstock session.close()阻塞
+        import os
+
+        os._exit(0 if success else 1)
 
     except KeyboardInterrupt:
         logger.info("用户中断操作")
@@ -491,7 +504,9 @@ def main():
         os._exit(1)
     except Exception as e:
         logger.error(f"执行失败: {e}")
-        return 1
+        import os
+
+        os._exit(1)
 
 
 if __name__ == "__main__":

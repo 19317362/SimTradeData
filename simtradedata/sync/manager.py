@@ -313,6 +313,9 @@ class SyncManager(BaseManager):
                             "message": "所有数据已完成",
                         }
                         full_result["summary"][
+                            "total_phases"
+                        ] = 4  # 基础数据更新、增量同步、扩展数据、缺口检测
+                        full_result["summary"][
                             "successful_phases"
                         ] = 4  # 假设4个阶段都完成
                         return full_result
@@ -349,6 +352,11 @@ class SyncManager(BaseManager):
                     full_result["summary"][
                         "successful_phases"
                     ] += 3  # 标记跳过的阶段为成功
+                    full_result["summary"]["total_phases"] += 3  # 增加总阶段数
+
+                    self.logger.debug(
+                        f"断点续传: 跳过3个阶段后，successful_phases={full_result['summary']['successful_phases']}, total_phases={full_result['summary']['total_phases']}"
+                    )
 
                     # 阶段2: 同步扩展数据（断点续传）
                     log_phase_start("阶段2", "扩展数据同步（断点续传）")
@@ -369,6 +377,11 @@ class SyncManager(BaseManager):
                                 "result": extended_result,
                             }
                             full_result["summary"]["successful_phases"] += 1
+                            full_result["summary"]["total_phases"] += 1
+
+                            self.logger.debug(
+                                f"断点续传: 扩展数据同步完成后，successful_phases={full_result['summary']['successful_phases']}, total_phases={full_result['summary']['total_phases']}"
+                            )
 
                             log_phase_complete(
                                 "扩展数据同步",
@@ -402,7 +415,10 @@ class SyncManager(BaseManager):
                             full_result["duration_seconds"] = (
                                 end_time - start_time
                             ).total_seconds()
-                            full_result["summary"]["total_phases"] = 4
+
+                            self.logger.debug(
+                                f"断点续传: 准备返回，final successful_phases={full_result['summary']['successful_phases']}, total_phases={full_result['summary']['total_phases']}"
+                            )
 
                             return full_result
 
@@ -476,7 +492,14 @@ class SyncManager(BaseManager):
                         )
                     else:
                         full_result["summary"]["failed_phases"] += 1
-                        log_error(f"股票列表更新失败: {stock_list_result['error']}")
+                        error_msg = stock_list_result.get("error", "未知错误")
+                        log_error(f"股票列表更新失败: {error_msg}")
+
+                        # 股票列表更新失败时,尝试使用数据库中的现有股票
+                        self.logger.info(
+                            "⚠️  股票列表更新失败,尝试使用数据库中的现有股票"
+                        )
+                        symbols = self._get_active_stocks_from_db()
 
                 except Exception as e:
                     log_error(f"基础数据更新失败: {e}")
@@ -899,8 +922,8 @@ class SyncManager(BaseManager):
             ),
             status_data AS (
                 SELECT DISTINCT symbol, status FROM extended_sync_status
-                WHERE symbol IN ({placeholders}) 
-                AND target_date = ? AND status = 'completed'
+                WHERE symbol IN ({placeholders})
+                AND target_date = ? AND status IN ('completed', 'partial')
             )
             SELECT 
                 sl.symbol,
@@ -972,8 +995,9 @@ class SyncManager(BaseManager):
                         f"🔧 修复状态: {symbol} completed -> {actual_status} (财务:{has_financial}, 估值:{has_valuation})"
                     )
 
-                # 需要处理的条件：实际状态不是完成
-                if actual_status != "completed":
+                # 需要处理的条件：实际状态既不是完成也不是部分完成
+                # 修复：partial状态（只有估值数据）的股票视为已完成，不再重复处理
+                if actual_status not in ("completed", "partial"):
                     symbols_needing_processing.append(symbol)
                     stats["needs_processing"] += 1
 

@@ -170,6 +170,20 @@ class DataProcessingEngine(BaseManager):
                 raw_data = raw_data["data"]
                 self.logger.debug(f"最终解包后的数据类型: {type(raw_data)}")
 
+            # 处理unified_error_handler的标准返回格式: {'success': True, 'data': ..., 'error_code': None, 'message': ...}
+            elif (
+                isinstance(raw_data, dict)
+                and "success" in raw_data
+                and raw_data.get("success") is True
+                and "data" in raw_data
+                and "error_code" in raw_data
+                and "message" in raw_data
+            ):
+                raw_data = raw_data["data"]
+                self.logger.debug(
+                    f"解包unified_error_handler格式后的数据类型: {type(raw_data)}"
+                )
+
             # 如果是简单的包装格式 {"data": ...}（没有success字段）
             elif (
                 isinstance(raw_data, dict)

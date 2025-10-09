@@ -202,9 +202,8 @@ class IncrementalSync:
                                 logger.warning(f"智能补充股票 {symbol} 时出错: {e}")
                                 backfill_stats["backfill_errors"] += 1
 
-                        # 更新进度条（如果有的话）
-                        if progress_bar:
-                            progress_bar.update(len(batch_symbols))
+                        # 注意：不在这里更新主进度条，因为正常增量同步阶段会更新
+                        # 避免重复更新导致进度超过100%
 
                     logger.info(
                         f"智能补充完成: 检查了 {backfill_stats['checked_symbols']} 只股票，"
