@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 # 项目内导入
 from ..config import Config
+from ..core import extract_data_safely
 from ..core.base_manager import BaseManager
 from ..core.error_handling import ValidationError, unified_error_handler
 from ..data_sources.manager import DataSourceManager
@@ -101,12 +102,8 @@ class DataProcessingEngine(BaseManager):
 
         try:
             # 获取原始数据
-            self.logger.debug(f"开始获取原始数据: {symbol}")
             raw_data = self.data_source_manager.get_daily_data(
                 symbol, start_date, end_date
-            )
-            self.logger.debug(
-                f"原始数据获取完成，类型: {type(raw_data)}, 内容: {raw_data}"
             )
 
             # 检查数据格式
@@ -133,84 +130,19 @@ class DataProcessingEngine(BaseManager):
                 self.logger.error(f"检查数据格式时出错: {e}")
                 raise
 
-            # 统一数据格式处理 - 避免多次拆包
-            # 调试：记录完整的原始数据结构
-            if isinstance(raw_data, dict):
-                self.logger.debug(f"API返回字典，键: {list(raw_data.keys())}")
-                self.logger.debug(
-                    f"success字段值: {raw_data.get('success')}, 类型: {type(raw_data.get('success'))}"
-                )
-                if "data" in raw_data:
-                    self.logger.debug(f"data字段类型: {type(raw_data['data'])}")
+            # 统一数据格式处理 - 使用统一的数据解包函数
+            raw_data = extract_data_safely(raw_data)
 
-            # 处理多层嵌套的API响应格式
-            # 递归解包相同的success/data结构，直到达到不同的结构
-            while (
-                isinstance(raw_data, dict)
-                and "success" in raw_data
-                and raw_data.get("success") is True
-                and "data" in raw_data
-                and isinstance(raw_data["data"], dict)
-                and "success" in raw_data["data"]
-                and "error_code" in raw_data
-                and "message" in raw_data
-            ):
-                raw_data = raw_data["data"]
-                self.logger.debug(f"递归解包相同结构后的数据类型: {type(raw_data)}")
-
-            # 最后一层解包: {'success': bool, 'data': [...], 'count': int, 'source': str}
-            if (
-                isinstance(raw_data, dict)
-                and "success" in raw_data
-                and raw_data.get("success") is True
-                and "data" in raw_data
-                and "count" in raw_data
-                and "source" in raw_data
-            ):
-                raw_data = raw_data["data"]
-                self.logger.debug(f"最终解包后的数据类型: {type(raw_data)}")
-
-            # 处理unified_error_handler的标准返回格式: {'success': True, 'data': ..., 'error_code': None, 'message': ...}
-            elif (
-                isinstance(raw_data, dict)
-                and "success" in raw_data
-                and raw_data.get("success") is True
-                and "data" in raw_data
-                and "error_code" in raw_data
-                and "message" in raw_data
-            ):
-                raw_data = raw_data["data"]
-                self.logger.debug(
-                    f"解包unified_error_handler格式后的数据类型: {type(raw_data)}"
-                )
-
-            # 如果是简单的包装格式 {"data": ...}（没有success字段）
-            elif (
-                isinstance(raw_data, dict)
-                and "data" in raw_data
-                and "success" not in raw_data
-            ):
-                raw_data = raw_data["data"]
-                self.logger.debug(f"解包data格式后的数据: {type(raw_data)}")
-            # 否则直接使用原始数据
-
-            self.logger.debug(f"处理后数据类型: {type(raw_data)}")
-            try:
-                if hasattr(raw_data, "shape"):
-                    self.logger.debug(f"DataFrame形状: {raw_data.shape}")
-                    self.logger.debug(f"DataFrame列数: {len(raw_data.columns)}")
-                    self.logger.debug(f"DataFrame列名: {list(raw_data.columns)}")
-            except Exception as e:
-                self.logger.error(f"检查DataFrame属性失败: {e}")
-                raise
+            # 检查解包后的数据
+            if raw_data is None:
+                self._log_warning("process_symbol_data", f"数据解包后为空: {symbol}")
+                return result
 
             # 如果数据是DataFrame，进行批量处理和计算
             if hasattr(raw_data, "iterrows") and hasattr(raw_data, "sort_values"):
-                self.logger.debug("开始DataFrame数据处理")
                 processed_count = self._process_dataframe_data(raw_data, symbol, result)
                 result["total_records"] = processed_count
             elif isinstance(raw_data, list):
-                self.logger.debug("开始列表数据处理")
                 # 如果是列表格式，转换为逐行处理
                 for item in raw_data:
                     try:
@@ -225,28 +157,10 @@ class DataProcessingEngine(BaseManager):
                         result["failed_dates"].append(str(item.get("date", start_date)))
 
                 result["total_records"] = len(result["processed_dates"])
-            elif isinstance(raw_data, dict):
-                # 处理字典类型数据（包括空字典）
-                if len(raw_data) == 0:
-                    self._log_warning(
-                        "process_symbol_data",
-                        f"数据源返回空字典: {symbol}, 日期范围: {start_date} 到 {end_date}",
-                    )
-                elif "success" in raw_data and not raw_data.get("success"):
-                    # 这是一个标准的失败响应，记录为debug级别
-                    error_msg = raw_data.get("error", "未知错误")
-                    self.logger.debug(f"数据源返回失败响应: {symbol} - {error_msg}")
-                else:
-                    # 非空字典且非标准失败响应，可能是其他格式的数据
-                    self._log_warning(
-                        "process_symbol_data",
-                        f"收到字典格式数据但未能处理: {symbol}, 键: {list(raw_data.keys())}",
-                    )
             else:
-                # 详细记录不支持的数据格式，包括数据内容用于调试
-                self._log_warning(
-                    "process_symbol_data",
-                    f"不支持的数据格式: {type(raw_data)}, 数据内容: {raw_data}, 符号: {symbol}",
+                # 不支持的数据格式（非DataFrame、非列表）
+                self.logger.warning(
+                    f"无法处理的数据格式: {type(raw_data)}, 符号: {symbol}"
                 )
 
         except Exception as e:
@@ -285,34 +199,14 @@ class DataProcessingEngine(BaseManager):
             records_stored = 0
             for row_idx, (_, row) in enumerate(df.iterrows()):
                 try:
-                    self.logger.debug(f"处理第 {row_idx+1} 行数据，索引: {row.name}")
-
                     # 转换为字典并验证
-                    try:
-                        row_dict = row.to_dict()
-                        self.logger.debug(
-                            f"row.to_dict() 成功，字典大小: {len(row_dict)}"
-                        )
-                    except Exception as e:
-                        self.logger.error(f"row.to_dict() 失败: {e}")
-                        raise
-
-                    try:
-                        validated_data = self._validate_and_prepare_data(row_dict)
-                        self.logger.debug(f"数据验证成功")
-                    except Exception as e:
-                        self.logger.error(f"数据验证失败: {e}")
-                        raise
+                    row_dict = row.to_dict()
+                    validated_data = self._validate_and_prepare_data(row_dict)
 
                     # 存储数据
-                    try:
-                        self._store_enhanced_market_data(
-                            validated_data, symbol, row_dict.get("date")
-                        )
-                        self.logger.debug(f"数据存储成功")
-                    except Exception as e:
-                        self.logger.error(f"数据存储失败: {e}")
-                        raise
+                    self._store_enhanced_market_data(
+                        validated_data, symbol, row_dict.get("date")
+                    )
 
                     result["processed_dates"].append(str(row_dict.get("date")))
                     records_stored += 1
@@ -338,11 +232,6 @@ class DataProcessingEngine(BaseManager):
         import numpy as np
         import pandas as pd
 
-        # 调试信息
-        self.logger.debug(f"计算衍生字段开始: {symbol}, DataFrame形状: {df.shape}")
-        self.logger.debug(f"DataFrame列: {list(df.columns)}")
-        self.logger.debug(f"DataFrame数据类型: {df.dtypes}")
-
         # 确保数据按日期排序
         df = df.sort_values("date")
 
@@ -350,14 +239,7 @@ class DataProcessingEngine(BaseManager):
         numeric_columns = ["open", "high", "low", "close", "volume", "amount"]
         for col in numeric_columns:
             if col in df.columns:
-                try:
-                    old_type = df[col].dtype
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-                    self.logger.debug(
-                        f"列 {col} 类型转换: {old_type} -> {df[col].dtype}"
-                    )
-                except Exception as e:
-                    self.logger.warning(f"列 {col} 类型转换失败: {e}")
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
         # 计算前一日收盘价（向前填充）
         try:
@@ -450,8 +332,6 @@ class DataProcessingEngine(BaseManager):
         except Exception as e:
             self.logger.error(f"设置第一行默认值失败: {e}")
             raise
-
-        self.logger.debug(f"为股票 {symbol} 计算了 {len(df)} 条记录的衍生字段")
 
         return df
 

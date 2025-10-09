@@ -18,6 +18,7 @@ from .error_handling import (
     unified_error_handler,
 )
 from .logging_mixin import LoggingMixin, log_method_execution
+from .utils import extract_data_safely
 
 __all__ = [
     "BaseManager",
@@ -29,4 +30,5 @@ __all__ = [
     "ValidationError",
     "ResourceNotFoundError",
     "ExternalServiceError",
+    "extract_data_safely",
 ]

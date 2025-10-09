@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import Config
+from ..core import extract_data_safely
 from ..data_sources import DataSourceManager
 from ..database import DatabaseManager
 from ..preprocessor import DataProcessingEngine
@@ -33,13 +34,12 @@ class IncrementalSync:
         Args:
             db_manager: 数据库管理器
             data_source_manager: 数据源管理器
-            preprocessor: 数据预处理器
+            processing_engine: 数据处理引擎
             config: 配置对象
         """
         self.db_manager = db_manager
         self.data_source_manager = data_source_manager
         self.processing_engine = processing_engine
-        self.preprocessor = processing_engine  # 兼容性别名
         self.config = config or Config()
 
         # 同步配置
@@ -49,8 +49,10 @@ class IncrementalSync:
         self.sync_frequencies = self.config.get("sync.frequencies", ["1d"])
         self.enable_parallel = self.config.get("sync.enable_parallel", True)
 
-        # 智能补充配置
-        self.enable_smart_backfill = self.config.get("sync.enable_smart_backfill", True)
+        # 智能补充配置（默认禁用，可通过配置启用）
+        self.enable_smart_backfill = self.config.get(
+            "sync.enable_smart_backfill", False
+        )
         self.backfill_batch_size = self.config.get("sync.backfill_batch_size", 50)
         self.backfill_sample_size = self.config.get("sync.backfill_sample_size", 10)
 
@@ -65,32 +67,6 @@ class IncrementalSync:
         }
 
         logger.info("增量同步器初始化完成")
-
-    def _extract_data_safely(self, data: Any) -> Any:
-        """
-        统一的数据格式处理方法，避免多次拆包
-
-        Args:
-            data: 可能被包装的数据
-
-        Returns:
-            Any: 拆包后的实际数据
-        """
-        # 如果是标准成功响应格式 {"success": True, "data": ..., "count": ...}
-        if isinstance(data, dict) and "success" in data:
-            if data.get("success"):
-                return data.get("data")
-            else:
-                # 失败响应，返回空字典
-                return {}
-
-        # 如果是简单包装格式 {"data": ...} (没有success字段)
-        elif isinstance(data, dict) and "data" in data and "success" not in data:
-            return data["data"]
-
-        # 否则直接返回原数据
-        else:
-            return data
 
     def sync_all_symbols(
         self,
@@ -540,7 +516,7 @@ class IncrementalSync:
                 )
 
                 # 统一数据格式处理 - 避免多次拆包
-                actual_result = self._extract_data_safely(process_result)
+                actual_result = extract_data_safely(process_result)
 
                 # 统计结果
                 result["success_count"] = len(actual_result.get("processed_dates", []))
@@ -869,15 +845,7 @@ class IncrementalSync:
     def _update_sync_status(self, target_date: date, stats: Dict[str, Any]):
         """更新同步状态"""
         try:
-            # 使用正确的字段名（与数据库表结构匹配）
-            sql = """
-            INSERT OR REPLACE INTO sync_status
-            (symbol, frequency, last_sync_date, last_data_date, status,
-             error_message, total_records, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """
-
-            # 修正同步状态判断逻辑
+            # 确定同步状态
             effective_success = stats["success_count"] > 0
             effective_error = stats["error_count"] > 0
 
@@ -888,40 +856,20 @@ class IncrementalSync:
             else:
                 sync_status = "failed"
 
+            # 构建错误消息
             error_msg = f"成功={stats['success_count']}, 错误={stats['error_count']}, 跳过={stats['skipped_count']}"
 
-            # 计算实际插入/更新的记录数
-            # 从sync_date_ranges中统计实际的数据记录数
-            actual_records_count = 0
-            sync_ranges = stats.get("sync_date_ranges", {})
+            # 使用成功数量作为记录数（简化统计）
+            actual_records_count = stats["success_count"]
 
-            for frequency_data in sync_ranges.values():
-                if isinstance(frequency_data, dict) and "sync_ranges" in frequency_data:
-                    for symbol_range in frequency_data["sync_ranges"].values():
-                        if isinstance(symbol_range, dict):
-                            actual_records_count += symbol_range.get("sync_count", 0)
+            # 插入汇总记录
+            sql = """
+            INSERT OR REPLACE INTO sync_status
+            (symbol, frequency, last_sync_date, last_data_date, status,
+             error_message, total_records, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """
 
-            # 如果无法从sync_ranges获取，则查询数据库中目标日期的实际记录数
-            if actual_records_count == 0 and sync_status in [
-                "completed",
-                "partial_success",
-            ]:
-                try:
-                    actual_count_sql = """
-                    SELECT COUNT(*) as count 
-                    FROM market_data 
-                    WHERE date = ? AND frequency = '1d'
-                    """
-                    count_result = self.db_manager.fetchone(
-                        actual_count_sql, (str(target_date),)
-                    )
-                    if count_result:
-                        actual_records_count = count_result["count"]
-                except Exception as e:
-                    logger.warning(f"查询实际记录数失败: {e}")
-                    actual_records_count = stats["success_count"]  # 备用方案
-
-            # 为增量同步创建一个汇总记录
             self.db_manager.execute(
                 sql,
                 (
@@ -931,13 +879,13 @@ class IncrementalSync:
                     str(target_date),  # last_data_date
                     sync_status,  # status
                     error_msg,  # error_message
-                    actual_records_count,  # total_records - 使用实际记录数
+                    actual_records_count,  # total_records
                     datetime.now().isoformat(),  # updated_at
                 ),
             )
 
             logger.info(
-                f"同步状态已更新: {sync_status}, 实际记录数: {actual_records_count}"
+                f"同步状态已更新: {sync_status}, 记录数: {actual_records_count}"
             )
 
         except Exception as e:

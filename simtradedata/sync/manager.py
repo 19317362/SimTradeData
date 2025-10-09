@@ -13,7 +13,12 @@ from typing import Any, Dict, List, Optional
 
 # 项目内导入
 from ..config import Config
-from ..core import BaseManager, ValidationError, unified_error_handler
+from ..core import (
+    BaseManager,
+    ValidationError,
+    extract_data_safely,
+    unified_error_handler,
+)
 from ..data_sources import DataSourceManager
 from ..database import DatabaseManager
 from ..preprocessor import DataProcessingEngine
@@ -145,7 +150,6 @@ class SyncManager(BaseManager):
         """
         # 初始化缓存
         self._market_cache = {}
-        self._stock_info_cache = {}
 
         super().__init__(
             config=config,
@@ -190,36 +194,6 @@ class SyncManager(BaseManager):
             "validator",
         ]
 
-    def _extract_data_safely(self, data: Any) -> Any:
-        """
-        统一的数据格式处理方法，避免多次拆包
-
-        Args:
-            data: 可能被包装的数据
-
-        Returns:
-            Any: 拆包后的实际数据
-        """
-        if not data:
-            return None
-
-        # 如果是标准成功响应格式 {"success": True, "data": ..., "count": ...}
-        if isinstance(data, dict) and "success" in data:
-            if data.get("success"):
-                return data.get("data")
-            else:
-                # 失败响应（标准响应格式），记录为DEBUG级别
-                error_msg = data.get("error", "未知错误")
-                self.logger.debug(f"数据源返回标准失败响应: {error_msg}")
-                return None
-
-        # 如果是简单包装格式 {"data": ...} (没有success字段)
-        elif isinstance(data, dict) and "data" in data and "success" not in data:
-            return data["data"]
-
-        # 否则直接返回原数据
-        return data
-
     @unified_error_handler(return_dict=True)
     def run_full_sync(
         self,
@@ -246,18 +220,16 @@ class SyncManager(BaseManager):
         if symbols is None:
             symbols = []
 
-        if not target_date:
-            raise ValidationError("目标日期不能为空")
-
+        # 处理目标日期：如果为空则使用今天，如果是未来则调整为今天
         if target_date is None:
             target_date = datetime.now().date()
-
-        # 限制目标日期不能超过今天，使用合理的历史日期
-        today = datetime.now().date()
-        if target_date > today:
-            # 如果目标日期是未来，使用最近的交易日
-            target_date = date(2025, 1, 24)  # 使用已知有数据的日期
-            self._log_warning("run_full_sync", f"目标日期调整为历史日期: {target_date}")
+        else:
+            today = datetime.now().date()
+            if target_date > today:
+                target_date = today
+                self._log_warning(
+                    "run_full_sync", f"目标日期不能是未来，已调整为今天: {target_date}"
+                )
 
         try:
             self._log_method_start("run_full_sync", target_date=target_date)
@@ -275,9 +247,7 @@ class SyncManager(BaseManager):
             }
 
             # 🔄 提前进行断点续传检查（在基础数据更新之前）
-            # 先获取股票列表用于断点续传检查
-            if symbols is None:
-                symbols = []
+            # 使用已经初始化的 symbols 列表
             if not symbols:
                 symbols = self._get_active_stocks_from_db()
                 if not symbols:
@@ -1521,15 +1491,12 @@ class SyncManager(BaseManager):
         """清理缓存"""
         if hasattr(self, "_market_cache"):
             self._market_cache.clear()
-        if hasattr(self, "_stock_info_cache"):
-            self._stock_info_cache.clear()
         self.logger.debug("缓存已清理")
 
     def get_cache_stats(self) -> Dict[str, int]:
         """获取缓存统计信息"""
         return {
             "market_cache_size": len(getattr(self, "_market_cache", {})),
-            "stock_info_cache_size": len(getattr(self, "_stock_info_cache", {})),
         }
 
     def _fetch_detailed_stock_info(self, symbol: str):
@@ -1545,13 +1512,13 @@ class SyncManager(BaseManager):
                 return
 
             # 双重解包数据（因为是嵌套格式）
-            detail_info = self._extract_data_safely(response)
+            detail_info = extract_data_safely(response)
             if (
                 isinstance(detail_info, dict)
                 and detail_info.get("success")
                 and "data" in detail_info
             ):
-                detail_info = self._extract_data_safely(detail_info)
+                detail_info = extract_data_safely(detail_info)
 
             if not detail_info or not isinstance(detail_info, dict):
                 self.logger.warning(f"获取股票详细信息失败: {symbol} - 解包后数据为空")
@@ -1745,53 +1712,26 @@ class SyncManager(BaseManager):
             len(symbols) >= batch_threshold
         )
 
-        # 输出详细决策信息
-        decision_msg = f"""
-                        {'='*70}
-                        📊 批量模式决策:
-                        - 数据库总股票: {total_stocks}
-                        - 需要处理: {len(symbols)}
-                        - 待处理阈值: {batch_threshold}
-                        - 总库存阈值: {total_threshold}
-                        - 批量模式: {should_use_batch}
-                        {'='*70}
-                        """
-        print(decision_msg, flush=True)  # 强制输出到stdout
-        self.logger.info(f"📊 批量模式决策:")
-        self.logger.info(f"  - 数据库总股票: {total_stocks}")
-        self.logger.info(f"  - 需要处理: {len(symbols)}")
-        self.logger.info(f"  - 待处理阈值: {batch_threshold}")
-        self.logger.info(f"  - 总库存阈值: {total_threshold}")
-        self.logger.info(
-            f"  - 决策结果: {'✅ 启用批量模式' if should_use_batch else '⛔ 使用逐个模式'}"
-        )
+        # 简化的批量模式决策日志
+        decision_reason = []
+        if len(symbols) >= batch_threshold:
+            decision_reason.append(f"待处理≥{batch_threshold}")
+        if total_stocks >= total_threshold:
+            decision_reason.append(f"总库存≥{total_threshold}")
 
-        # 记录决策理由
-        if should_use_batch:
-            reason = []
-            if len(symbols) >= batch_threshold:
-                reason.append(
-                    f"待处理股票({len(symbols)})达到批量阈值({batch_threshold})"
-                )
-            if total_stocks >= total_threshold:
-                reason.append(
-                    f"数据库总股票({total_stocks})达到总库存阈值({total_threshold})"
-                )
-            self.logger.info(f"  - 决策理由: {'; '.join(reason)}")
-        else:
-            self.logger.info(
-                f"  - 决策理由: 未达到批量模式阈值，使用逐个模式以减少资源消耗"
-            )
+        reason_text = (
+            "; ".join(decision_reason) if decision_reason else "未达到批量阈值"
+        )
+        self.logger.info(
+            f"批量模式决策: 总库存{total_stocks}, 待处理{len(symbols)}, "
+            f"{'✅启用' if should_use_batch else '⛔禁用'} ({reason_text})"
+        )
 
         financial_data_map = {}  # symbol -> financial_data
 
         if should_use_batch:
-            print(
-                f"⚡ 检测到批量场景({len(symbols)}只股票)，启用批量财务数据导入",
-                flush=True,
-            )
             self.logger.info(
-                f"⚡ 检测到批量场景({len(symbols)}只股票)，启用批量财务数据导入"
+                f"⚡ 批量模式：开始批量财务数据导入（{len(symbols)}只股票）"
             )
             result["batch_mode"] = True
 
@@ -2076,7 +2016,7 @@ class SyncManager(BaseManager):
                             )
 
                             # 标准数据源响应格式解包
-                            financial_data = self._extract_data_safely(financial_result)
+                            financial_data = extract_data_safely(financial_result)
 
                             # 🔧 修复：可能有嵌套的success/data结构，需要再次解包
                             if (
@@ -2122,7 +2062,7 @@ class SyncManager(BaseManager):
                     )
 
                     # 标准数据源响应格式解包
-                    valuation_data = self._extract_data_safely(valuation_result)
+                    valuation_data = extract_data_safely(valuation_result)
 
                     # 获取数据来源
                     data_source = (
