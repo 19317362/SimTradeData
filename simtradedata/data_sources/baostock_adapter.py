@@ -27,6 +27,8 @@ class BaoStockAdapter(BaseDataSource):
         """
         super().__init__("baostock", config)
         self._baostock = None
+        self._last_connect_time = None  # 记录上次连接时间
+        self._session_timeout = 600  # 会话超时时间(秒)，10分钟
 
     def connect(self) -> bool:
         """
@@ -36,6 +38,8 @@ class BaoStockAdapter(BaseDataSource):
         只是建立会话连接的形式调用。
         """
         try:
+            from datetime import datetime
+
             import baostock as bs
 
             self._baostock = bs
@@ -46,6 +50,7 @@ class BaoStockAdapter(BaseDataSource):
                 raise DataSourceConnectionError(f"BaoStock连接失败: {lg.error_msg}")
 
             self._connected = True
+            self._last_connect_time = datetime.now()  # 记录连接时间
             logger.info(f"BaoStock连接成功，版本: {bs.__version__}")
             return True
 
@@ -61,16 +66,41 @@ class BaoStockAdapter(BaseDataSource):
         if self._baostock and self._connected:
             try:
                 self._baostock.logout()
-                logger.info("BaoStock连接已断开")
+                logger.debug("BaoStock连接已断开")
             except:
                 pass
 
         self._baostock = None
         self._connected = False
+        self._last_connect_time = None
 
     def is_connected(self) -> bool:
         """检查连接状态"""
         return self._connected and self._baostock is not None
+
+    def _ensure_connection(self):
+        """
+        确保连接有效，如果会话过期则自动重连
+
+        BaoStock会话在长时间运行时容易过期，需要主动检测并重连
+        """
+        from datetime import datetime
+
+        # 检查是否已连接
+        if not self.is_connected():
+            logger.debug("BaoStock未连接，正在建立连接...")
+            self.connect()
+            return
+
+        # 检查会话是否超时
+        if self._last_connect_time:
+            elapsed = (datetime.now() - self._last_connect_time).total_seconds()
+            if elapsed > self._session_timeout:
+                logger.debug(
+                    f"BaoStock会话已超时({elapsed:.0f}秒 > {self._session_timeout}秒)，正在重新连接..."
+                )
+                self.disconnect()
+                self.connect()
 
     def get_daily_data(
         self,
@@ -89,8 +119,8 @@ class BaoStockAdapter(BaseDataSource):
         Returns:
             Dict[str, Any]: 日线数据
         """
-        if not self.is_connected():
-            self.connect()
+        # 确保连接有效
+        self._ensure_connection()
 
         symbol = self._normalize_symbol(symbol)
         start_date = self._normalize_date(start_date)
@@ -112,16 +142,16 @@ class BaoStockAdapter(BaseDataSource):
 
             # 检查查询是否成功
             if rs.error_code != "0":
-                logger.warning(f"BaoStock查询失败 {bs_symbol}: {rs.error_msg}")
-
-                # 如果是会话过期错误，尝试重新连接
+                # 如果是会话过期错误，尝试重新连接一次
                 if (
                     "login" in rs.error_msg.lower()
                     or "not login" in rs.error_msg.lower()
                     or "用户未登录" in rs.error_msg
                     or "未登录" in rs.error_msg
                 ):
-                    logger.info(f"检测到BaoStock会话过期，尝试重新建立连接...")
+                    logger.debug(
+                        f"检测到BaoStock会话过期: {rs.error_msg}，尝试重新建立连接..."
+                    )
                     self.disconnect()
                     self.connect()
 
@@ -136,11 +166,12 @@ class BaoStockAdapter(BaseDataSource):
                     )
 
                     if rs.error_code != "0":
-                        logger.error(
+                        logger.warning(
                             f"重新连接后仍查询失败 {bs_symbol}: {rs.error_msg}"
                         )
                         return {}
                 else:
+                    logger.warning(f"BaoStock查询失败 {bs_symbol}: {rs.error_msg}")
                     return {}
 
             # 直接使用get_data()获取DataFrame
@@ -200,8 +231,8 @@ class BaoStockAdapter(BaseDataSource):
         Returns:
             Union[Dict, List[Dict]]: 股票信息
         """
-        if not self.is_connected():
-            self.connect()
+        # 确保连接有效
+        self._ensure_connection()
 
         def _fetch_data():
             if symbol:
@@ -301,8 +332,8 @@ class BaoStockAdapter(BaseDataSource):
         Returns:
             List[Dict[str, Any]]: 估值数据列表
         """
-        if not self.is_connected():
-            self.connect()
+        # 确保连接有效
+        self._ensure_connection()
 
         symbol = self._normalize_symbol(symbol)
         start_date = self._normalize_date(start_date)
@@ -395,8 +426,8 @@ class BaoStockAdapter(BaseDataSource):
         Returns:
             Dict[str, Any]: 财务数据
         """
-        if not self.is_connected():
-            self.connect()
+        # 确保连接有效
+        self._ensure_connection()
 
         symbol = self._normalize_symbol(symbol)
         report_date = self._normalize_date(report_date)
@@ -449,8 +480,8 @@ class BaoStockAdapter(BaseDataSource):
         self, start_date: Union[str, date], end_date: Union[str, date] = None
     ) -> List[Dict[str, Any]]:
         """获取交易日历"""
-        if not self.is_connected():
-            self.connect()
+        # 确保连接有效
+        self._ensure_connection()
 
         start_date = self._normalize_date(start_date)
         end_date = self._normalize_date(end_date) if end_date else start_date
@@ -471,8 +502,8 @@ class BaoStockAdapter(BaseDataSource):
         end_date: Union[str, date, None] = None,
     ) -> List[Dict[str, Any]]:
         """获取除权除息数据"""
-        if not self.is_connected():
-            self.connect()
+        # 确保连接有效
+        self._ensure_connection()
 
         symbol = self._normalize_symbol(symbol)
         start_date = self._normalize_date(start_date)
@@ -537,8 +568,8 @@ class BaoStockAdapter(BaseDataSource):
                 "error": str 错误信息 (可选)
             }
         """
-        if not self.is_connected():
-            self.connect()
+        # 确保连接有效
+        self._ensure_connection()
 
         symbol = self._normalize_symbol(symbol)
 
@@ -596,8 +627,8 @@ class BaoStockAdapter(BaseDataSource):
                 "error": str 错误信息 (可选)
             }
         """
-        if not self.is_connected():
-            self.connect()
+        # 确保连接有效
+        self._ensure_connection()
 
         symbol = self._normalize_symbol(symbol)
 
@@ -653,8 +684,8 @@ class BaoStockAdapter(BaseDataSource):
                 "error": str 错误信息 (可选)
             }
         """
-        if not self.is_connected():
-            self.connect()
+        # 确保连接有效
+        self._ensure_connection()
 
         symbol = self._normalize_symbol(symbol)
 
@@ -712,8 +743,8 @@ class BaoStockAdapter(BaseDataSource):
                 "error": str 错误信息 (可选)
             }
         """
-        if not self.is_connected():
-            self.connect()
+        # 确保连接有效
+        self._ensure_connection()
 
         symbol = self._normalize_symbol(symbol)
 
@@ -771,8 +802,8 @@ class BaoStockAdapter(BaseDataSource):
                 "error": str 错误信息 (可选)
             }
         """
-        if not self.is_connected():
-            self.connect()
+        # 确保连接有效
+        self._ensure_connection()
 
         symbol = self._normalize_symbol(symbol)
 
@@ -828,8 +859,8 @@ class BaoStockAdapter(BaseDataSource):
                 "error": str 错误信息 (可选)
             }
         """
-        if not self.is_connected():
-            self.connect()
+        # 确保连接有效
+        self._ensure_connection()
 
         symbol = self._normalize_symbol(symbol)
 
