@@ -327,7 +327,7 @@ class SyncManager(BaseManager):
             ) as pbar:
                 try:
                     # 更新交易日历
-                    update_phase_description("更新交易日历")
+                    update_phase_description("交易日历")
                     calendar_result = self._update_trading_calendar(target_date)
                     full_result["phases"]["calendar_update"] = calendar_result
                     full_result["summary"]["total_phases"] += 1
@@ -341,7 +341,7 @@ class SyncManager(BaseManager):
                         full_result["summary"]["failed_phases"] += 1
 
                     # 更新股票列表
-                    update_phase_description("更新股票列表（可能需要较长时间）")
+                    update_phase_description("股票列表")
                     stock_list_result = self._update_stock_list(target_date)
                     full_result["phases"]["stock_list_update"] = stock_list_result
                     full_result["summary"]["total_phases"] += 1
