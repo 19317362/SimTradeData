@@ -213,3 +213,4 @@ data/
 CLAUDE*.md
 .claude/*
 .spec-workflow/*
+*.h5
