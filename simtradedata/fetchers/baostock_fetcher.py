@@ -3,7 +3,7 @@ BaoStock data fetcher implementation
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import baostock as bs
 import pandas as pd
@@ -68,9 +68,12 @@ class BaoStockFetcher:
             pass  # Ignore errors in destructor
 
     @retry_on_failure
-    def fetch_stock_list(self) -> pd.DataFrame:
+    def fetch_stock_list(self, date: str = None) -> pd.DataFrame:
         """
         Fetch list of all stocks (excluding indices)
+
+        Args:
+            date: Query date (YYYY-MM-DD). If None, use yesterday to avoid missing data
 
         Returns:
             DataFrame with columns: code, tradeStatus, code_name
@@ -83,7 +86,14 @@ class BaoStockFetcher:
         """
         self.login()
 
-        rs = bs.query_all_stock(day=format_date(datetime.now()))
+        # Use provided date or previous day to avoid querying dates without data
+        if date is None:
+            query_date = datetime.now() - timedelta(days=1)
+            query_date_str = format_date(query_date)
+        else:
+            query_date_str = date
+
+        rs = bs.query_all_stock(day=query_date_str)
         data_list = []
 
         while (rs.error_code == "0") & rs.next():

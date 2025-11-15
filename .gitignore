@@ -211,6 +211,8 @@ __marimo__/
 data/
 *.json
 CLAUDE*.md
+AGENTS.md
 .claude/*
 .spec-workflow/*
 *.h5
+*.png

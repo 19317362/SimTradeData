@@ -329,33 +329,7 @@ class DataPipeline:
         if start_date is None:
             start_date = (datetime.now() - timedelta(days=365 * 5)).strftime("%Y-%m-%d")
 
-        # Get stock list
-        if stock_list is None:
-            logger.info("Fetching stock list from BaoStock...")
-            with self.baostock_fetcher:
-                stock_df = self.baostock_fetcher.fetch_stock_list()
-                stock_list = [
-                    convert_to_ptrade_code(code, "baostock")
-                    for code in stock_df["code"].tolist()
-                ]
-            logger.info(f"Found {len(stock_list)} stocks")
-
-        # Filter existing stocks if needed
-        if skip_existing:
-            existing = self.writer.get_existing_stocks("market")
-            stock_list = [s for s in stock_list if s not in existing]
-            # Important: Use print to bypass logging suppression
-            print(
-                f"[INFO] Skipping {len(existing)} existing stocks, {len(stock_list)} remaining"
-            )
-            logger.info(
-                f"Skipping {len(existing)} existing stocks, "
-                f"{len(stock_list)} remaining"
-            )
-
         # Process stocks sequentially (BaoStock doesn't support concurrent requests)
-        results = {"success": 0, "failure": 0, "total": len(stock_list)}
-
         # Temporarily raise logging level to ERROR to prevent INFO/WARNING messages
         # from interrupting the progress bar
         root_logger = logging.getLogger()
@@ -365,6 +339,32 @@ class DataPipeline:
         try:
             # Login to both fetchers
             with self.market_fetcher, self.baostock_fetcher:
+                # Get stock list (must be inside context manager)
+                if stock_list is None:
+                    logger.info("Fetching stock list from BaoStock...")
+                    stock_df = self.baostock_fetcher.fetch_stock_list(date=end_date)
+                    stock_list = [
+                        convert_to_ptrade_code(code, "baostock")
+                        for code in stock_df["code"].tolist()
+                    ]
+                    logger.info(f"Found {len(stock_list)} stocks")
+
+                # Filter existing stocks if needed
+                original_count = len(stock_list)
+                if skip_existing:
+                    existing = self.writer.get_existing_stocks("market")
+                    stock_list = [s for s in stock_list if s not in existing]
+                    skipped_count = original_count - len(stock_list)
+                    # Important: Use print to bypass logging suppression
+                    print(
+                        f"[INFO] Skipping {skipped_count} existing stocks, {len(stock_list)} remaining"
+                    )
+                    logger.info(
+                        f"Skipping {skipped_count} existing stocks, "
+                        f"{len(stock_list)} remaining"
+                    )
+
+                results = {"success": 0, "failure": 0, "total": len(stock_list)}
                 # Use tqdm progress bar
                 with tqdm(
                     total=len(stock_list),
