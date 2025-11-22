@@ -37,6 +37,7 @@ def get_price(
     frequency: str = "1d",
     fields: Optional[List[str]] = None,
     fq: str = "none",
+    extra_fields: Optional[List[str]] = None,
     **kwargs,
 ) -> Optional[pd.DataFrame]:
     """
@@ -49,6 +50,7 @@ def get_price(
         frequency: '1d' for daily (BaoStock only supports daily)
         fields: List of fields ['open', 'high', 'low', 'close', 'volume', 'money']
         fq: 'none', 'pre', 'post'
+        extra_fields: Additional fields to fetch from baostock (e.g., ['isST', 'tradestatus'])
 
     Returns:
         DataFrame with datetime index
@@ -74,6 +76,7 @@ def get_price(
             end_date=end_date,
             frequency="d",
             adjustflag=adjustflag,
+            extra_fields=extra_fields,
         )
 
         if df is None or df.empty:
@@ -87,8 +90,12 @@ def get_price(
         if "amount" in df.columns:
             df = df.rename(columns={"amount": "money"})
 
-        # Select requested fields
-        available_fields = [f for f in fields if f in df.columns]
+        # Select requested fields, but keep extra_fields if they were requested
+        final_fields = fields[:]
+        if extra_fields:
+            final_fields.extend(extra_fields)
+
+        available_fields = [f for f in final_fields if f in df.columns]
         if available_fields:
             df = df[available_fields]
 

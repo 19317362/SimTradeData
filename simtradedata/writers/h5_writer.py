@@ -17,22 +17,13 @@ logger = logging.getLogger(__name__)
 
 class HDF5Writer:
     """
-    Write data to HDF5 files in PTrade-compatible format
+    Writer for HDF5 files in PTrade format
 
-    This handles writing data to:
-    - ptrade_data.h5: market data, exrights, metadata
-    - ptrade_fundamentals.h5: fundamentals, valuation
-    - ptrade_adj_pre.h5: adjust factors
-    - ptrade_dividend_cache.h5: dividend cache (optional)
+    Note: Thread locks removed as download_efficient.py uses sequential processing.
+    BaoStock does not support concurrent access, so locks are unnecessary overhead.
     """
 
-    def __init__(self, output_dir: str = "data"):
-        """
-        Initialize HDF5 writer
-
-        Args:
-            output_dir: Directory to save HDF5 files
-        """
+    def __init__(self, output_dir: str = "."):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -41,6 +32,8 @@ class HDF5Writer:
         self.ptrade_fundamentals_path = self.output_dir / "ptrade_fundamentals.h5"
         self.ptrade_adj_pre_path = self.output_dir / "ptrade_adj_pre.h5"
         self.ptrade_dividend_cache_path = self.output_dir / "ptrade_dividend_cache.h5"
+
+        logger.info(f"HDF5Writer initialized with output_dir: {self.output_dir}")
 
     def write_market_data(
         self, symbol: str, data: pd.DataFrame, mode: str = "a"
@@ -67,7 +60,7 @@ class HDF5Writer:
             store.put(
                 key,
                 data,
-                format="fixed",
+                format="table",
                 complevel=9,
                 complib="blosc",
             )
@@ -196,10 +189,15 @@ class HDF5Writer:
             logger.warning("No stock metadata to write")
             return
 
+        # Convert all columns to string to avoid PyTables mixed-type warning
+        metadata_clean = metadata_df.copy()
+        for col in metadata_clean.columns:
+            metadata_clean[col] = metadata_clean[col].astype(str)
+
         with pd.HDFStore(self.ptrade_data_path, mode=mode) as store:
             store.put(
                 "stock_metadata",
-                metadata_df,
+                metadata_clean,
                 format="table",
                 complevel=9,
                 complib="blosc",
@@ -266,7 +264,7 @@ class HDF5Writer:
             store.put(
                 key,
                 data,
-                format="fixed",
+                format="table",
                 complevel=9,
                 complib="blosc",
             )
@@ -301,7 +299,7 @@ class HDF5Writer:
             store.put(
                 symbol,
                 data,
-                format="fixed",
+                format="table",
                 complevel=9,
                 complib="blosc",
             )

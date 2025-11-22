@@ -1,8 +1,9 @@
 """
-Utility functions for stock code conversion and date handling
+Utility functions for stock code conversion
 """
 
-from datetime import datetime, timedelta
+from functools import wraps
+import time
 
 
 def convert_to_ptrade_code(code: str, source: str = "baostock") -> str:
@@ -91,84 +92,6 @@ def convert_from_ptrade_code(code: str, target_source: str) -> str:
         return code
 
     return code
-
-
-def parse_date(date_str: str) -> datetime:
-    """
-    Parse date string to datetime object
-
-    Supports formats: 'YYYY-MM-DD', 'YYYYMMDD'
-
-    Args:
-        date_str: Date string
-
-    Returns:
-        datetime object
-    """
-    if "-" in date_str:
-        return datetime.strptime(date_str, "%Y-%m-%d")
-    return datetime.strptime(date_str, "%Y%m%d")
-
-
-def format_date(dt: datetime, format_type: str = "dash") -> str:
-    """
-    Format datetime to string
-
-    Args:
-        dt: datetime object
-        format_type: 'dash' for YYYY-MM-DD, 'compact' for YYYYMMDD
-
-    Returns:
-        Formatted date string
-    """
-    if format_type == "dash":
-        return dt.strftime("%Y-%m-%d")
-    elif format_type == "compact":
-        return dt.strftime("%Y%m%d")
-    return dt.strftime("%Y-%m-%d")
-
-
-def get_trading_dates(start_date: str, end_date: str) -> list[str]:
-    """
-    Generate list of potential trading dates (excluding weekends)
-
-    Note: This is a simple implementation. For accurate trading calendar,
-    use trading calendar data from data sources.
-
-    Args:
-        start_date: Start date string (YYYY-MM-DD)
-        end_date: End date string (YYYY-MM-DD)
-
-    Returns:
-        List of date strings
-    """
-    start = parse_date(start_date)
-    end = parse_date(end_date)
-
-    dates = []
-    current = start
-
-    while current <= end:
-        # Exclude weekends
-        if current.weekday() < 5:  # Monday=0, Friday=4
-            dates.append(format_date(current))
-        current += timedelta(days=1)
-
-    return dates
-
-
-def chunk_list(items: list, chunk_size: int) -> list[list]:
-    """
-    Split list into chunks
-
-    Args:
-        items: List to split
-        chunk_size: Size of each chunk
-
-    Returns:
-        List of chunks
-    """
-    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
 def retry_on_failure(max_retries: int = 3, delay: float = 5.0):
