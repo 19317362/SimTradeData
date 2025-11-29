@@ -55,38 +55,57 @@ class UnifiedDataFetcher(BaoStockFetcher):
     ) -> pd.DataFrame:
         """
         Fetch all daily data types in a single API call
-        
+
         This method fetches market data, valuation data, and status data
         in one query, significantly reducing API calls.
-        
+
         Args:
             symbol: Stock code in PTrade format (e.g., '600000.SH')
             start_date: Start date (YYYY-MM-DD)
             end_date: End date (YYYY-MM-DD)
             frequency: d=daily, w=weekly, m=monthly
             adjustflag: "1"=forward, "2"=backward, "3"=none
-        
+
         Returns:
             DataFrame with all fields: market + valuation + status
             Columns: date, open, high, low, close, volume, amount,
                     peTTM, pbMRQ, psTTM, pcfNcfTTM, turn, isST, tradestatus
         """
+        import signal
+
         # Convert to BaoStock format
         bs_code = convert_from_ptrade_code(symbol, "baostock")
-        
+
         # Build fields string (all fields in one call)
         fields_str = ",".join(UNIFIED_DAILY_FIELDS)
-        
-        # Single API call to fetch all data
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            fields_str,
-            start_date=start_date,
-            end_date=end_date,
-            frequency=frequency,
-            adjustflag=adjustflag,
-        )
-        
+
+        # Timeout handler
+        def timeout_handler(signum, frame):
+            raise TimeoutError(f"BaoStock API timeout for {symbol}")
+
+        # Set 60 second timeout
+        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(60)
+
+        try:
+            logger.debug(f"Fetching unified data for {symbol}...")
+            # Single API call to fetch all data
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                fields_str,
+                start_date=start_date,
+                end_date=end_date,
+                frequency=frequency,
+                adjustflag=adjustflag,
+            )
+            signal.alarm(0)  # Cancel timeout
+        except TimeoutError as e:
+            signal.alarm(0)
+            logger.error(f"Timeout fetching {symbol}, skipping")
+            raise
+        finally:
+            signal.signal(signal.SIGALRM, old_handler)
+
         if rs.error_code != "0":
             raise RuntimeError(
                 f"Failed to query unified data for {symbol}: {rs.error_msg}"

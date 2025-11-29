@@ -35,7 +35,7 @@ OUTPUT_DIR = "data"
 LOG_FILE = "data/download_efficient.log"
 
 # Date range configuration
-START_DATE = "2017-01-01"
+START_DATE = "2025-01-01"  # Changed from 2017-01-01 to reduce data volume
 END_DATE = None  # None means use current date
 INCREMENTAL_DAYS = None  # Set to N to only update last N days
 
@@ -61,7 +61,7 @@ class EfficientBaoStockDownloader:
     in a single call and routing them to appropriate HDF5 structures.
     """
     
-    def __init__(self, output_dir: str = ".", skip_fundamentals: bool = False):
+    def __init__(self, output_dir: str = ".", skip_fundamentals: bool = False, skip_metadata: bool = False):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -73,9 +73,14 @@ class EfficientBaoStockDownloader:
 
         # Configuration
         self.skip_fundamentals = skip_fundamentals
+        self.skip_metadata = skip_metadata
 
         # Cache for status data (used to build stock_status_history)
         self.status_cache = {}
+
+        # Track failed stocks for retry
+        self.failed_stocks = []
+        self.timeout_stocks = []
     
     def download_stock_data(
         self, symbol: str, start_date: str, end_date: str
@@ -96,6 +101,7 @@ class EfficientBaoStockDownloader:
         """
         try:
             # === 1. Fetch unified daily data (ONE API call) ===
+            logger.info(f"Starting download for {symbol}")
             unified_df = self.unified_fetcher.fetch_unified_daily_data(
                 symbol, start_date, end_date
             )
@@ -112,14 +118,15 @@ class EfficientBaoStockDownloader:
             if 'market' in split_data:
                 self.writer.write_market_data(symbol, split_data['market'], mode='a')
 
-            # 3.2 Valuation data -> ptrade_fundamentals.h5/valuation/{symbol}
-            # Calculate market cap if valuation data available
+            # 3.2 Extract valuation data (will be written later after market cap calculation)
+            # Note: Valuation data (PE, PB, PS, etc.) is obtained from daily history
+            # and will be written even if skip_fundamentals=True
             valuation_data = split_data.get('valuation')
 
             # 3.3 Cache status data for later processing
             if 'status' in split_data:
                 self.status_cache[symbol] = split_data['status']
-            
+
             # === 4. Download other data (cannot be merged) ===
             # 4.1 Adjust factor
             try:
@@ -133,34 +140,38 @@ class EfficientBaoStockDownloader:
             except Exception as e:
                 logger.warning(f"Failed to fetch adjust factor for {symbol}: {e}")
             
-            # 4.2 Stock basic info
+            # 4.2 Stock basic info (skip for incremental updates to save time)
             basic_info = {}
-            try:
-                basic_df = self.standard_fetcher.fetch_stock_basic(symbol)
-                if not basic_df.empty:
-                    basic_info = {
-                        'status': basic_df['status'].values[0],
-                        'ipoDate': basic_df['ipoDate'].values[0],
-                        'outDate': basic_df['outDate'].values[0],
-                        'type': basic_df['type'].values[0],
-                        'code_name': basic_df['code_name'].values[0]
-                    }
-            except Exception as e:
-                logger.warning(f"Failed to fetch basic info for {symbol}: {e}")
-            
-            # 4.3 Industry classification
+            if not self.skip_metadata:
+                try:
+                    basic_df = self.standard_fetcher.fetch_stock_basic(symbol)
+                    if not basic_df.empty:
+                        basic_info = {
+                            'status': basic_df['status'].values[0],
+                            'ipoDate': basic_df['ipoDate'].values[0],
+                            'outDate': basic_df['outDate'].values[0],
+                            'type': basic_df['type'].values[0],
+                            'code_name': basic_df['code_name'].values[0]
+                        }
+                except Exception as e:
+                    logger.warning(f"Failed to fetch basic info for {symbol}: {e}")
+
+            # 4.3 Industry classification (skip for incremental updates to save time)
             industry_info = {}
-            try:
-                industry_df = self.standard_fetcher.fetch_stock_industry(symbol)
-                if not industry_df.empty:
-                    industry_info = {
-                        'industry': industry_df['industry'].values[0],
-                        'industryClassification': industry_df['industryClassification'].values[0]
-                    }
-            except Exception as e:
-                logger.warning(f"Failed to fetch industry for {symbol}: {e}")
+            if not self.skip_metadata:
+                try:
+                    industry_df = self.standard_fetcher.fetch_stock_industry(symbol)
+                    if not industry_df.empty:
+                        industry_info = {
+                            'industry': industry_df['industry'].values[0],
+                            'industryClassification': industry_df['industryClassification'].values[0]
+                        }
+                except Exception as e:
+                    logger.warning(f"Failed to fetch industry for {symbol}: {e}")
             
-            # === 4.4 Quarterly fundamentals data ===
+            # === 4.4 Quarterly fundamentals data (only if skip_fundamentals=False) ===
+            # Note: This downloads quarterly financial statements (balance sheet, income, cash flow)
+            # Valuation data from step 3.2 is independent and will be written regardless
             fundamental_df = pd.DataFrame()
             if not self.skip_fundamentals:
                 try:
@@ -206,17 +217,20 @@ class EfficientBaoStockDownloader:
                 except Exception as e:
                     logger.warning(f"Failed to fetch fundamentals for {symbol}: {e}")
 
-            # === 4.5 Calculate market cap and write valuation ===
+            # === 4.5 Write valuation data (always written, regardless of skip_fundamentals) ===
+            # Valuation data includes: PE, PB, PS, PCF, turnover rate, close price
+            # These are obtained from daily history API and are always available
             if valuation_data is not None and not valuation_data.empty:
                 try:
                     from simtradedata.utils.market_cap_calculator import calculate_market_cap
 
                     # Calculate market cap using fundamental data (if available)
+                    # If skip_fundamentals=True, fundamental_df is empty, market_cap will be NaN
                     valuation_with_cap = calculate_market_cap(
                         valuation_data, fundamental_df, symbol
                     )
 
-                    # Write valuation data with market cap
+                    # Write valuation data to ptrade_fundamentals.h5/valuation/{symbol}
                     self.writer.write_valuation(symbol, valuation_with_cap, mode='a')
                 except Exception as e:
                     logger.error(f"Failed to calculate/write valuation for {symbol}: {e}")
@@ -232,9 +246,14 @@ class EfficientBaoStockDownloader:
                 'blocks': json.dumps(industry_info, ensure_ascii=False) if industry_info else None,
                 'has_info': bool(basic_info)
             }
-            
+
+        except TimeoutError as e:
+            logger.error(f"Timeout downloading {symbol}: {e}")
+            self.timeout_stocks.append(symbol)
+            return None
         except Exception as e:
             logger.error(f"Failed to download {symbol}: {e}")
+            self.failed_stocks.append(symbol)
             return None
     
     def download_batch(
@@ -268,26 +287,36 @@ class EfficientBaoStockDownloader:
         return metadata_list
 
 
-def download_all_data(incremental_days=None, skip_fundamentals=False):
+def download_all_data(incremental_days=None, skip_fundamentals=False, skip_metadata=False, start_date=None):
     """
     Main download function
 
     Args:
         incremental_days: If set, only update last N days for existing stocks
         skip_fundamentals: If True, skip quarterly fundamentals download
+        skip_metadata: If True, skip stock_basic and stock_industry (faster for incremental updates)
+        start_date: Override default start date (YYYY-MM-DD)
     """
     print("=" * 70)
     print("Efficient BaoStock Data Download Program")
     print("=" * 70)
     if incremental_days:
         print(f"Mode: Incremental update (last {incremental_days} days)")
+        # Auto-enable skip_metadata for incremental updates
+        if not skip_metadata:
+            skip_metadata = True
+            print("  Auto-enabled: Skip metadata refresh (faster)")
     else:
         print("Mode: Full download")
 
     if skip_fundamentals:
-        print("Fundamentals: Skipped (use without --skip-fundamentals to download)")
+        print("Fundamentals: Quarterly financial statements skipped")
+        print("             (Valuation data like PE, PB will still be saved)")
     else:
-        print("Fundamentals: Enabled")
+        print("Fundamentals: Quarterly financial statements enabled")
+
+    if skip_metadata:
+        print("Metadata: Stock basic info and industry classification skipped (faster)")
 
     print("=" * 70)
     
@@ -310,7 +339,8 @@ def download_all_data(incremental_days=None, skip_fundamentals=False):
     # Initialize downloader
     downloader = EfficientBaoStockDownloader(
         output_dir=OUTPUT_DIR,
-        skip_fundamentals=skip_fundamentals
+        skip_fundamentals=skip_fundamentals,
+        skip_metadata=skip_metadata
     )
     downloader.unified_fetcher.login()
     downloader.standard_fetcher.login()
@@ -547,7 +577,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--skip-fundamentals",
         action="store_true",
-        help="Skip quarterly fundamentals download (only download market data)",
+        help="Skip quarterly fundamentals download (financial statements). "
+             "Note: Valuation data (PE, PB, PS, etc.) from daily history will still be saved.",
+    )
+    parser.add_argument(
+        "--skip-metadata",
+        action="store_true",
+        help="Skip stock basic info and industry classification (faster, auto-enabled for incremental mode)",
     )
 
     args = parser.parse_args()
@@ -555,5 +591,6 @@ if __name__ == "__main__":
     incremental = args.incremental or INCREMENTAL_DAYS
     download_all_data(
         incremental_days=incremental,
-        skip_fundamentals=args.skip_fundamentals
+        skip_fundamentals=args.skip_fundamentals,
+        skip_metadata=args.skip_metadata
     )
