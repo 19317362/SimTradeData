@@ -169,5 +169,83 @@ class UnifiedDataFetcher(BaoStockFetcher):
         logger.info(
             f"Batch fetch complete: {len(result)}/{len(symbols)} stocks successful"
         )
-        
+
         return result
+
+    def fetch_5m_kline_data(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        adjustflag: str = "3"
+    ) -> pd.DataFrame:
+        """
+        Fetch 5-minute K-line data for a single stock
+
+        Args:
+            symbol: Stock code in PTrade format (e.g., '600000.SH')
+            start_date: Start date (YYYY-MM-DD)
+            end_date: End date (YYYY-MM-DD)
+            adjustflag: "1"=forward adjust, "2"=backward adjust, "3"=none (default)
+
+        Returns:
+            DataFrame with columns: time, open, high, low, close, volume, money
+            Index: DatetimeIndex (date + time combined)
+
+        Note:
+            - 5-minute data only available from 2019-01-02
+            - Does not include valuation indicators (peTTM, pbMRQ, etc.)
+            - Index data not supported for minute-level frequency
+        """
+        from simtradedata.config.field_mappings import KLINE_5M_FIELDS
+
+        # Convert to BaoStock format
+        bs_code = convert_from_ptrade_code(symbol, "baostock")
+
+        # Build fields string (excluding 'code' which we don't need to store)
+        fields_str = ",".join(KLINE_5M_FIELDS)
+
+        logger.debug(f"Fetching 5m kline data for {symbol}...")
+
+        # Call BaoStock API with frequency="5" for 5-minute bars
+        rs = bs.query_history_k_data_plus(
+            bs_code,
+            fields_str,
+            start_date=start_date,
+            end_date=end_date,
+            frequency="5",  # 5-minute K-line
+            adjustflag=adjustflag,
+        )
+
+        if rs.error_code != "0":
+            raise RuntimeError(
+                f"Failed to query 5m kline for {symbol}: {rs.error_msg}"
+            )
+
+        df = rs.get_data()
+
+        if df.empty:
+            logger.warning(f"No 5m kline data for {symbol}")
+            return pd.DataFrame()
+
+        # Data processing
+        # 1. Combine date and time into datetime index
+        df['datetime'] = pd.to_datetime(df['date'] + ' ' + df['time'])
+        df = df.set_index('datetime')
+
+        # 2. Rename columns (amount -> money)
+        df = df.rename(columns={'amount': 'money'})
+
+        # 3. Convert numeric columns
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'money']
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # 4. Keep only needed columns
+        keep_cols = ['time', 'open', 'high', 'low', 'close', 'volume', 'money']
+        df = df[[c for c in keep_cols if c in df.columns]]
+
+        logger.info(f"Fetched 5m kline for {symbol}: {len(df)} rows")
+
+        return df

@@ -34,6 +34,7 @@ class HDF5Writer:
         self.ptrade_fundamentals_path = self.output_dir / "ptrade_fundamentals.h5"
         self.ptrade_adj_pre_path = self.output_dir / "ptrade_adj_pre.h5"
         self.ptrade_dividend_cache_path = self.output_dir / "ptrade_dividend_cache.h5"
+        self.ptrade_data_5m_path = self.output_dir / "ptrade_data_5m.h5"
 
         logger.info(f"HDF5Writer initialized with output_dir: {self.output_dir}")
 
@@ -546,3 +547,61 @@ class HDF5Writer:
         except Exception as e:
             logger.error(f"File integrity check failed for {filepath}: {e}")
             return False
+
+    def write_5m_kline_data(
+        self, symbol: str, data: pd.DataFrame, mode: str = "a"
+    ) -> None:
+        """
+        Write 5-minute K-line data to ptrade_data_5m.h5/stock_data/{symbol}
+
+        Args:
+            symbol: Stock code in PTrade format (e.g., '000001.SZ')
+            data: DataFrame with columns [time, open, high, low, close, volume, money]
+                  Index should be DatetimeIndex (date + time combined)
+            mode: 'a' for append, 'w' for overwrite
+        """
+        if data.empty:
+            logger.warning(f"No 5m kline data to write for {symbol}")
+            return
+
+        # Ensure datetime index
+        if not isinstance(data.index, pd.DatetimeIndex):
+            data.index = pd.to_datetime(data.index)
+
+        key = f"stock_data/{symbol}"
+
+        with pd.HDFStore(self.ptrade_data_5m_path, mode=mode) as store:
+            store.put(
+                key,
+                data,
+                format="table",
+                complevel=9,
+                complib="blosc",
+            )
+
+        logger.info(
+            f"Wrote 5m kline for {symbol} to {self.ptrade_data_5m_path}: "
+            f"{len(data)} rows"
+        )
+
+    def get_existing_5m_stocks(self) -> List[str]:
+        """
+        Get list of stocks already in 5-minute HDF5 file
+
+        Returns:
+            List of stock codes that have 5-minute data
+        """
+        if not self.ptrade_data_5m_path.exists():
+            return []
+
+        try:
+            with pd.HDFStore(self.ptrade_data_5m_path, mode="r") as store:
+                keys = store.keys()
+                # Extract stock codes from /stock_data/* keys
+                stocks = [
+                    k.split("/")[-1] for k in keys if k.startswith("/stock_data/")
+                ]
+                return list(set(stocks))
+        except Exception as e:
+            logger.error(f"Error reading 5m stocks from {self.ptrade_data_5m_path}: {e}")
+            return []

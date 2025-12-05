@@ -78,3 +78,30 @@ DATA_ROUTING = {
         'rename': {}
     }
 }
+
+# 5-minute K-line fields (different from daily, no valuation data)
+# Note: 5-minute data only available from 2019-01-02
+KLINE_5M_FIELDS = [
+    "date",    # Trading date (YYYY-MM-DD)
+    "time",    # Bar end time (HH:MM:SS, e.g., "09:35:00")
+    "code",    # Stock code
+    "open",    # Open price
+    "high",    # High price
+    "low",     # Low price
+    "close",   # Close price
+    "volume",  # Volume (shares)
+    "amount",  # Turnover (CNY)
+]
+
+KLINE_5M_FIELD_MAP = {
+    "amount": "money",  # BaoStock 'amount' -> PTrade 'money'
+}
+
+KLINE_5M_ROUTING = {
+    'kline_5m': {
+        'target_file': 'ptrade_data_5m.h5',
+        'target_path': 'stock_data/{symbol}',
+        'fields': ['date', 'time', 'open', 'high', 'low', 'close', 'volume', 'amount'],
+        'rename': {'amount': 'money'}
+    }
+}
