@@ -31,6 +31,18 @@ import pandas as pd
 from tables import NaturalNameWarning
 from tqdm import tqdm
 
+# Monkey-patch baostock for pandas 2.x compatibility
+# baostock uses DataFrame.append() which was removed in pandas 2.0
+def _patched_get_data(self):
+    if self.data is None:
+        return pd.DataFrame()
+    if len(self.data) == 0:
+        return pd.DataFrame(columns=self.fields)
+    return pd.DataFrame(self.data, columns=self.fields)
+
+bs.data.resultset.ResultData.get_data = _patched_get_data
+
+
 from simtradedata.fetchers.unified_fetcher import UnifiedDataFetcher
 from simtradedata.writers.h5_writer import HDF5Writer
 from simtradedata.utils.code_utils import convert_to_ptrade_code

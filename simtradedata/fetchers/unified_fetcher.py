@@ -230,7 +230,7 @@ class UnifiedDataFetcher(BaoStockFetcher):
 
         # Data processing
         # 1. Combine date and time into datetime index
-        df['datetime'] = pd.to_datetime(df['date'] + ' ' + df['time'])
+        df['datetime'] = pd.to_datetime(df['time'], format='%Y%m%d%H%M%S%f')
         df = df.set_index('datetime')
 
         # 2. Rename columns (amount -> money)
