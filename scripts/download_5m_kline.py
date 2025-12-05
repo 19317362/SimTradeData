@@ -53,6 +53,9 @@ SAFE_API_THRESHOLD = 90000  # Stop before hitting limit
 # Batch configuration
 BATCH_SIZE = 50  # Stocks per batch for progress saving
 
+# Ensure data directory exists before logging setup
+Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
 # Logging
 logging.basicConfig(
     filename=LOG_FILE,
