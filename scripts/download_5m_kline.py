@@ -7,6 +7,7 @@ This program downloads 5-minute K-line data from BaoStock API with:
 2. API call limit control (default: 100,000 calls/day)
 3. Independent storage in ptrade_data_5m.h5
 4. Multiple run support to complete full download
+5. Multi-threaded download for improved performance
 
 Note: 5-minute data only available from 2019-01-02.
 """
@@ -25,6 +26,10 @@ import json
 import logging
 import warnings
 from datetime import datetime, date
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock, local
+from queue import Queue
+import threading
 
 import baostock as bs
 import pandas as pd
@@ -65,6 +70,10 @@ SAFE_API_THRESHOLD = 90000  # Stop before hitting limit
 # Batch configuration
 BATCH_SIZE = 50  # Stocks per batch for progress saving
 
+# Thread configuration
+DEFAULT_WORKERS = 4  # Default number of worker threads
+MAX_WORKERS = 16  # Maximum worker threads allowed
+
 # Ensure data directory exists before logging setup
 Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -84,16 +93,17 @@ logger.addHandler(console_handler)
 
 
 class APICounter:
-    """API call counter with daily limit tracking"""
+    """Thread-safe API call counter with daily limit tracking"""
 
     def __init__(self, daily_limit: int = DAILY_API_LIMIT):
         self.daily_limit = daily_limit
         self.calls_today = 0
         self.calls_date = None
+        self._lock = Lock()
 
     def check_limit(self, threshold: int = None) -> bool:
         """
-        Check if API calls are below limit
+        Check if API calls are below limit (thread-safe)
 
         Args:
             threshold: Custom threshold (default: SAFE_API_THRESHOLD)
@@ -104,60 +114,176 @@ class APICounter:
         threshold = threshold or SAFE_API_THRESHOLD
         today = date.today()
 
-        # Reset counter if new day
-        if self.calls_date != today:
-            self.calls_today = 0
-            self.calls_date = today
+        with self._lock:
+            # Reset counter if new day
+            if self.calls_date != today:
+                self.calls_today = 0
+                self.calls_date = today
 
-        return self.calls_today < threshold
+            return self.calls_today < threshold
 
     def increment(self, count: int = 1) -> None:
-        """Increment API call counter"""
-        self.calls_today += count
+        """Increment API call counter (thread-safe)"""
+        with self._lock:
+            self.calls_today += count
 
     def get_remaining(self, threshold: int = None) -> int:
-        """Get remaining API calls before threshold"""
+        """Get remaining API calls before threshold (thread-safe)"""
         threshold = threshold or SAFE_API_THRESHOLD
-        return max(0, threshold - self.calls_today)
+        with self._lock:
+            return max(0, threshold - self.calls_today)
 
     def to_dict(self) -> dict:
-        """Export counter state"""
-        return {
-            "api_calls_today": self.calls_today,
-            "api_calls_date": str(self.calls_date) if self.calls_date else None,
-        }
+        """Export counter state (thread-safe)"""
+        with self._lock:
+            return {
+                "api_calls_today": self.calls_today,
+                "api_calls_date": str(self.calls_date) if self.calls_date else None,
+            }
 
     def from_dict(self, data: dict) -> None:
-        """Import counter state"""
-        self.calls_today = data.get("api_calls_today", 0)
-        date_str = data.get("api_calls_date")
-        if date_str and date_str != "None":
-            try:
-                self.calls_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-            except ValueError:
+        """Import counter state (thread-safe)"""
+        with self._lock:
+            self.calls_today = data.get("api_calls_today", 0)
+            date_str = data.get("api_calls_date")
+            if date_str and date_str != "None":
+                try:
+                    self.calls_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                except ValueError:
+                    self.calls_date = None
+            else:
                 self.calls_date = None
-        else:
-            self.calls_date = None
+
+
+class ThreadLocalBaoStock:
+    """Thread-local BaoStock connection manager"""
+
+    def __init__(self):
+        self._local = local()
+        self._lock = Lock()
+        self._connections = {}  # Track connections by thread id
+
+    def get_connection(self):
+        """Get or create thread-local BaoStock connection"""
+        thread_id = threading.current_thread().ident
+
+        if not hasattr(self._local, 'logged_in') or not self._local.logged_in:
+            lg = bs.login()
+            if lg.error_code != '0':
+                raise RuntimeError(f"BaoStock login failed: {lg.error_msg}")
+            self._local.logged_in = True
+            with self._lock:
+                self._connections[thread_id] = True
+            logger.debug(f"Thread {thread_id} logged in to BaoStock")
+
+        return bs
+
+    def logout_all(self):
+        """Logout all thread connections"""
+        with self._lock:
+            for thread_id in list(self._connections.keys()):
+                try:
+                    bs.logout()
+                except:
+                    pass
+            self._connections.clear()
+
+
+class WriteTask:
+    """Task for background writer thread"""
+    def __init__(self, symbol: str, df: pd.DataFrame, result_type: str):
+        self.symbol = symbol
+        self.df = df
+        self.result_type = result_type
+
+
+class BackgroundWriter:
+    """Background thread for HDF5 writing (producer-consumer pattern)"""
+
+    def __init__(self, writer: 'HDF5Writer'):
+        self.writer = writer
+        self.queue = Queue()
+        self._stop_event = threading.Event()
+        self._thread = None
+        self.write_count = 0
+        self.error_count = 0
+
+    def start(self):
+        """Start background writer thread"""
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._thread.start()
+        logger.info("Background writer thread started")
+
+    def stop(self):
+        """Stop background writer thread and wait for queue to drain"""
+        self._stop_event.set()
+        # Add sentinel to unblock queue.get()
+        self.queue.put(None)
+        if self._thread:
+            self._thread.join(timeout=30)
+        logger.info(f"Background writer stopped. Writes: {self.write_count}, Errors: {self.error_count}")
+
+    def submit(self, task: WriteTask):
+        """Submit a write task to the queue"""
+        self.queue.put(task)
+
+    def _writer_loop(self):
+        """Main loop for background writer"""
+        while not self._stop_event.is_set() or not self.queue.empty():
+            try:
+                task = self.queue.get(timeout=1)
+                if task is None:  # Sentinel value
+                    break
+
+                try:
+                    if task.df is not None and not task.df.empty:
+                        self.writer.write_5m_kline_data(task.symbol, task.df, mode="a")
+                        self.write_count += 1
+                except Exception as e:
+                    logger.error(f"Error writing {task.symbol}: {e}")
+                    self.error_count += 1
+
+                self.queue.task_done()
+            except:
+                # Queue.get timeout, continue loop
+                pass
+
+    def wait_for_completion(self):
+        """Wait for all pending writes to complete"""
+        self.queue.join()
 
 
 class FiveMinuteKlineDownloader:
-    """5-minute K-line data downloader with progress tracking"""
+    """5-minute K-line data downloader with progress tracking and multi-threading"""
 
     def __init__(
         self,
         output_dir: str = OUTPUT_DIR,
         progress_file: str = PROGRESS_FILE,
+        num_workers: int = DEFAULT_WORKERS,
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.progress_file = Path(progress_file)
+        self.num_workers = min(num_workers, MAX_WORKERS)
 
         # Initialize components
         self.fetcher = UnifiedDataFetcher()
         self.writer = HDF5Writer(output_dir=output_dir)
 
-        # API counter
+        # Background writer (producer-consumer pattern, no locks needed for HDF5)
+        self._bg_writer = None
+
+        # Thread-safe lock for progress only
+        self._progress_lock = Lock()
+        self._stop_event = threading.Event()
+
+        # Thread-local BaoStock connections
+        self._thread_local_bs = ThreadLocalBaoStock()
+
+        # API counter (already thread-safe)
         self.api_counter = APICounter()
 
         # Load progress
@@ -166,8 +292,9 @@ class FiveMinuteKlineDownloader:
         # Restore API counter state
         self.api_counter.from_dict(self.progress)
 
-        # Track failures in current session
+        # Track failures in current session (thread-safe)
         self.session_failed = []
+        self._failed_lock = Lock()
 
     def _load_progress(self) -> dict:
         """Load download progress from JSON file"""
@@ -210,23 +337,25 @@ class FiveMinuteKlineDownloader:
         }
 
     def _save_progress(self) -> None:
-        """Save download progress to JSON file"""
-        self.progress["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.progress.update(self.api_counter.to_dict())
+        """Save download progress to JSON file (thread-safe)"""
+        with self._progress_lock:
+            self.progress["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.progress.update(self.api_counter.to_dict())
 
-        try:
-            with open(self.progress_file, "w", encoding="utf-8") as f:
-                json.dump(self.progress, f, ensure_ascii=False, indent=2)
-            logger.info(f"Progress saved: {len(self.progress['completed_stocks'])} completed")
-        except Exception as e:
-            logger.error(f"Error saving progress: {e}")
+            try:
+                with open(self.progress_file, "w", encoding="utf-8") as f:
+                    json.dump(self.progress, f, ensure_ascii=False, indent=2)
+                logger.info(f"Progress saved: {len(self.progress['completed_stocks'])} completed")
+            except Exception as e:
+                logger.error(f"Error saving progress: {e}")
 
     def download_stock_5m_data(
         self,
         symbol: str,
         start_date: str,
         end_date: str,
-    ) -> str:
+        use_thread_local: bool = False,
+    ) -> tuple:
         """
         Download 5-minute K-line data for a single stock
 
@@ -234,11 +363,22 @@ class FiveMinuteKlineDownloader:
             symbol: Stock code in PTrade format
             start_date: Start date (YYYY-MM-DD)
             end_date: End date (YYYY-MM-DD)
+            use_thread_local: Use thread-local BaoStock connection
 
         Returns:
-            "success" if data downloaded, "no_data" if no new data, "failed" if error
+            Tuple of (result_code, dataframe)
+            result_code: "success", "no_data", "failed", "stopped"
+            dataframe: Downloaded data or None
         """
         try:
+            # Check if stop requested
+            if self._stop_event.is_set():
+                return ("stopped", None)
+
+            # Use thread-local connection if in multi-threaded mode
+            if use_thread_local:
+                self._thread_local_bs.get_connection()
+
             # Fetch data
             df = self.fetcher.fetch_5m_kline_data(symbol, start_date, end_date)
 
@@ -247,18 +387,16 @@ class FiveMinuteKlineDownloader:
 
             if df.empty:
                 logger.info(f"No new 5m data for {symbol} ({start_date} ~ {end_date})")
-                return "no_data"  # No new data available for this date range
-
-            # Write to HDF5
-            self.writer.write_5m_kline_data(symbol, df, mode="a")
+                return ("no_data", None)
 
             logger.info(f"Downloaded 5m data for {symbol}: {len(df)} rows")
-            return "success"
+            return ("success", df)
 
         except Exception as e:
             logger.error(f"Failed to download {symbol}: {e}")
-            self.session_failed.append(symbol)
-            return "failed"
+            with self._failed_lock:
+                self.session_failed.append(symbol)
+            return ("failed", None)
 
     def get_stock_pool(self, end_date: str) -> list:
         """
@@ -305,6 +443,129 @@ class FiveMinuteKlineDownloader:
 
         return stock_pool
 
+    def _process_single_stock(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        api_threshold: int,
+    ) -> tuple:
+        """
+        Process a single stock for multi-threaded download
+
+        Args:
+            symbol: Stock code
+            start_date: Start date for full download
+            end_date: End date
+            api_threshold: API call threshold
+
+        Returns:
+            Tuple of (symbol, result_type, dataframe)
+            result_type: "success", "incremental", "no_data", "uptodate", "skipped_today", "failed", "stopped"
+            dataframe: Downloaded data or None
+        """
+        # Check if stop requested
+        if self._stop_event.is_set():
+            return (symbol, "stopped", None)
+
+        # Check API limit
+        if not self.api_counter.check_limit(api_threshold):
+            self._stop_event.set()
+            return (symbol, "stopped", None)
+
+        # Skip stocks already checked today with no new data (thread-safe check)
+        with self._progress_lock:
+            if symbol in self.progress.get("uptodate_stocks", []):
+                return (symbol, "skipped_today", None)
+
+        # Check stock's actual max date in H5 file
+        # Note: This read is safe because only the background writer writes to H5
+        stock_max_date = self.writer.get_5m_stock_max_date(symbol)
+
+        if stock_max_date:
+            if stock_max_date >= end_date:
+                # Stock is already up to date
+                return (symbol, "uptodate", None)
+            else:
+                # Need incremental download
+                download_start = (
+                    datetime.strptime(stock_max_date, "%Y-%m-%d")
+                    + pd.Timedelta(days=1)
+                ).strftime("%Y-%m-%d")
+
+                result_code, df = self.download_stock_5m_data(
+                    symbol, download_start, end_date, use_thread_local=True
+                )
+
+                if result_code == "success":
+                    return (symbol, "incremental", df)
+                elif result_code == "no_data":
+                    return (symbol, "no_data", None)
+                else:
+                    return (symbol, "failed", None)
+        else:
+            # Stock not in H5, need full download
+            result_code, df = self.download_stock_5m_data(
+                symbol, start_date, end_date, use_thread_local=True
+            )
+
+            if result_code == "success":
+                return (symbol, "success", df)
+            elif result_code == "no_data":
+                return (symbol, "no_data", None)
+            else:
+                return (symbol, "failed", None)
+
+    def _update_progress_from_result(
+        self,
+        symbol: str,
+        result_type: str,
+    ) -> str:
+        """
+        Update progress based on download result (thread-safe)
+
+        Returns:
+            Category for statistics: "new", "incremental", "uptodate", "skipped", "no_data", "failed"
+        """
+        with self._progress_lock:
+            if result_type == "success":
+                if symbol not in self.progress["completed_stocks"]:
+                    self.progress["completed_stocks"].append(symbol)
+                if symbol in self.progress["failed_stocks"]:
+                    self.progress["failed_stocks"].remove(symbol)
+                return "new"
+
+            elif result_type == "incremental":
+                if symbol not in self.progress["completed_stocks"]:
+                    self.progress["completed_stocks"].append(symbol)
+                if symbol in self.progress["failed_stocks"]:
+                    self.progress["failed_stocks"].remove(symbol)
+                return "incremental"
+
+            elif result_type == "uptodate":
+                if symbol not in self.progress["completed_stocks"]:
+                    self.progress["completed_stocks"].append(symbol)
+                return "uptodate"
+
+            elif result_type == "no_data":
+                # uptodate_stocks set 已经在 progress 里，不需要额外维护 set
+                if symbol not in self.progress["uptodate_stocks"]:
+                    self.progress["uptodate_stocks"].append(symbol)
+                if symbol not in self.progress["completed_stocks"]:
+                    self.progress["completed_stocks"].append(symbol)
+                return "no_data"
+
+            elif result_type == "skipped_today":
+                return "skipped"
+
+            elif result_type == "failed":
+                if symbol not in self.progress["failed_stocks"]:
+                    self.progress["failed_stocks"].append(symbol)
+                return "failed"
+
+            else:  # stopped
+                return "stopped"
+
     def download_all(
         self,
         max_stocks: int = None,
@@ -313,6 +574,7 @@ class FiveMinuteKlineDownloader:
         retry_failed: bool = False,
         start_date: str = None,
         end_date: str = None,
+        use_threading: bool = True,
     ) -> dict:
         """
         Download 5-minute K-line data for all stocks
@@ -324,6 +586,7 @@ class FiveMinuteKlineDownloader:
             retry_failed: Whether to retry previously failed stocks
             start_date: Override start date
             end_date: Override end date
+            use_threading: Use multi-threaded download (default: True)
 
         Returns:
             Summary dict with download statistics
@@ -346,6 +609,10 @@ class FiveMinuteKlineDownloader:
         print(f"API call limit: {api_threshold}")
         if max_stocks:
             print(f"Max stocks this session: {max_stocks}")
+        if use_threading:
+            print(f"Multi-threaded mode: {self.num_workers} workers")
+        else:
+            print("Single-threaded mode")
         print("=" * 70)
 
         # Login to BaoStock
@@ -393,86 +660,171 @@ class FiveMinuteKlineDownloader:
                 self.progress["uptodate_check_date"] = today
                 self.progress["uptodate_stocks"] = []
                 logger.info(f"New check date {today}, reset uptodate_stocks list")
-            uptodate_stocks = set(self.progress.get("uptodate_stocks", []))
 
-            # Download loop - check each stock's actual max date
+            # Get initial count for display (progress["uptodate_stocks"] is the source of truth)
+            initial_uptodate_count = len(self.progress.get("uptodate_stocks", []))
+
+            # Download statistics
             new_downloads = 0
             incremental_updates = 0
             skipped_uptodate = 0
             skipped_checked_today = 0
             failed_count = 0
+            processed_count = 0
 
             print(f"\nTotal stocks to process: {len(stocks_to_process)}")
-            print(f"Stocks already checked today (no new data): {len(uptodate_stocks)}")
+            print(f"Stocks already checked today (no new data): {initial_uptodate_count}")
             print(f"API calls remaining: {self.api_counter.get_remaining(api_threshold)}")
             print()
 
-            for i, symbol in enumerate(tqdm(stocks_to_process, desc="Processing")):
-                # Check API limit
-                if not self.api_counter.check_limit(api_threshold):
-                    print(f"\n\nAPI limit reached ({api_threshold}). Saving progress...")
-                    break
+            # Reset stop event
+            self._stop_event.clear()
 
-                # Skip stocks already checked today with no new data
-                if symbol in uptodate_stocks:
-                    skipped_checked_today += 1
-                    continue
+            if use_threading and self.num_workers > 1:
+                # Multi-threaded download with background writer
+                # Start background writer thread
+                self._bg_writer = BackgroundWriter(self.writer)
+                self._bg_writer.start()
 
-                # Check stock's actual max date in H5 file
-                stock_max_date = self.writer.get_5m_stock_max_date(symbol)
+                try:
+                    with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                        # Submit all tasks
+                        future_to_symbol = {
+                            executor.submit(
+                                self._process_single_stock,
+                                symbol,
+                                start_date,
+                                end_date,
+                                api_threshold,
+                            ): symbol
+                            for symbol in stocks_to_process
+                        }
 
-                if stock_max_date:
-                    if stock_max_date >= end_date:
-                        # Stock is already up to date
-                        skipped_uptodate += 1
-                        if symbol not in self.progress["completed_stocks"]:
-                            self.progress["completed_stocks"].append(symbol)
+                        # Process results as they complete
+                        with tqdm(total=len(stocks_to_process), desc="Processing") as pbar:
+                            for future in as_completed(future_to_symbol):
+                                symbol = future_to_symbol[future]
+                                try:
+                                    result = future.result()
+                                    symbol, result_type, df = result
+
+                                    # Submit data to background writer if we have data
+                                    if df is not None and not df.empty:
+                                        self._bg_writer.submit(WriteTask(symbol, df, result_type))
+
+                                    # Update progress and get category
+                                    category = self._update_progress_from_result(
+                                        symbol, result_type
+                                    )
+
+                                    # Update statistics
+                                    if category == "new":
+                                        new_downloads += 1
+                                    elif category == "incremental":
+                                        incremental_updates += 1
+                                    elif category == "uptodate":
+                                        skipped_uptodate += 1
+                                    elif category == "skipped":
+                                        skipped_checked_today += 1
+                                    elif category == "failed":
+                                        failed_count += 1
+                                    elif category == "stopped":
+                                        # API limit reached, cancel remaining futures
+                                        executor.shutdown(wait=False, cancel_futures=True)
+                                        print(f"\n\nAPI limit reached ({api_threshold}). Saving progress...")
+                                        break
+
+                                except Exception as e:
+                                    logger.error(f"Error processing {symbol}: {e}")
+                                    failed_count += 1
+
+                                processed_count += 1
+                                pbar.update(1)
+
+                                # Save progress periodically
+                                if processed_count % BATCH_SIZE == 0:
+                                    self._save_progress()
+
+                finally:
+                    # Wait for all writes to complete and stop background writer
+                    if self._bg_writer:
+                        print("\nWaiting for writes to complete...")
+                        self._bg_writer.wait_for_completion()
+                        self._bg_writer.stop()
+                        print(f"Background writer finished: {self._bg_writer.write_count} writes, {self._bg_writer.error_count} errors")
+
+            else:
+                # Single-threaded download (original logic)
+                for i, symbol in enumerate(tqdm(stocks_to_process, desc="Processing")):
+                    # Check API limit
+                    if not self.api_counter.check_limit(api_threshold):
+                        print(f"\n\nAPI limit reached ({api_threshold}). Saving progress...")
+                        break
+
+                    # Skip stocks already checked today with no new data
+                    if symbol in self.progress.get("uptodate_stocks", []):
+                        skipped_checked_today += 1
                         continue
-                    else:
-                        # Need incremental download
-                        download_start = (
-                            datetime.strptime(stock_max_date, "%Y-%m-%d")
-                            + pd.Timedelta(days=1)
-                        ).strftime("%Y-%m-%d")
 
-                        result = self.download_stock_5m_data(symbol, download_start, end_date)
-                        if result == "success":
-                            incremental_updates += 1
+                    # Check stock's actual max date in H5 file
+                    stock_max_date = self.writer.get_5m_stock_max_date(symbol)
+
+                    if stock_max_date:
+                        if stock_max_date >= end_date:
+                            # Stock is already up to date
+                            skipped_uptodate += 1
+                            if symbol not in self.progress["completed_stocks"]:
+                                self.progress["completed_stocks"].append(symbol)
+                            continue
+                        else:
+                            # Need incremental download
+                            download_start = (
+                                datetime.strptime(stock_max_date, "%Y-%m-%d")
+                                + pd.Timedelta(days=1)
+                            ).strftime("%Y-%m-%d")
+
+                            result_code, df = self.download_stock_5m_data(symbol, download_start, end_date)
+                            if result_code == "success":
+                                # Write directly in single-threaded mode
+                                self.writer.write_5m_kline_data(symbol, df, mode="a")
+                                incremental_updates += 1
+                                if symbol not in self.progress["completed_stocks"]:
+                                    self.progress["completed_stocks"].append(symbol)
+                                if symbol in self.progress["failed_stocks"]:
+                                    self.progress["failed_stocks"].remove(symbol)
+                            elif result_code == "no_data":
+                                # No new data available - mark as checked today
+                                if symbol not in self.progress["uptodate_stocks"]:
+                                    self.progress["uptodate_stocks"].append(symbol)
+                                if symbol not in self.progress["completed_stocks"]:
+                                    self.progress["completed_stocks"].append(symbol)
+                            else:  # failed
+                                failed_count += 1
+                                if symbol not in self.progress["failed_stocks"]:
+                                    self.progress["failed_stocks"].append(symbol)
+                    else:
+                        # Stock not in H5, need full download
+                        result_code, df = self.download_stock_5m_data(symbol, start_date, end_date)
+                        if result_code == "success":
+                            # Write directly in single-threaded mode
+                            self.writer.write_5m_kline_data(symbol, df, mode="a")
+                            new_downloads += 1
                             if symbol not in self.progress["completed_stocks"]:
                                 self.progress["completed_stocks"].append(symbol)
                             if symbol in self.progress["failed_stocks"]:
                                 self.progress["failed_stocks"].remove(symbol)
-                        elif result == "no_data":
-                            # No new data available - mark as checked today
-                            self.progress["uptodate_stocks"].append(symbol)
-                            uptodate_stocks.add(symbol)
-                            if symbol not in self.progress["completed_stocks"]:
-                                self.progress["completed_stocks"].append(symbol)
+                        elif result_code == "no_data":
+                            # No data available for this stock - mark as checked today
+                            if symbol not in self.progress["uptodate_stocks"]:
+                                self.progress["uptodate_stocks"].append(symbol)
                         else:  # failed
                             failed_count += 1
                             if symbol not in self.progress["failed_stocks"]:
                                 self.progress["failed_stocks"].append(symbol)
-                else:
-                    # Stock not in H5, need full download
-                    result = self.download_stock_5m_data(symbol, start_date, end_date)
-                    if result == "success":
-                        new_downloads += 1
-                        if symbol not in self.progress["completed_stocks"]:
-                            self.progress["completed_stocks"].append(symbol)
-                        if symbol in self.progress["failed_stocks"]:
-                            self.progress["failed_stocks"].remove(symbol)
-                    elif result == "no_data":
-                        # No data available for this stock - mark as checked today
-                        self.progress["uptodate_stocks"].append(symbol)
-                        uptodate_stocks.add(symbol)
-                    else:  # failed
-                        failed_count += 1
-                        if symbol not in self.progress["failed_stocks"]:
-                            self.progress["failed_stocks"].append(symbol)
 
-                # Save progress periodically
-                if (i + 1) % BATCH_SIZE == 0:
-                    self._save_progress()
+                    # Save progress periodically
+                    if (i + 1) % BATCH_SIZE == 0:
+                        self._save_progress()
 
             # Update completed_end_date if all stocks are now up to date
             total_processed = new_downloads + incremental_updates + skipped_uptodate
@@ -566,8 +918,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # First run (will save progress automatically)
+  # First run with multi-threading (default: 4 workers)
   python download_5m_kline.py
+
+  # Use 8 worker threads for faster download
+  python download_5m_kline.py --workers 8
+
+  # Single-threaded mode (for debugging)
+  python download_5m_kline.py --no-threading
 
   # Continue from last progress
   python download_5m_kline.py --resume
@@ -628,11 +986,23 @@ Examples:
         action="store_true",
         help="Show download progress and exit",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        metavar="N",
+        help=f"Number of worker threads (default: {DEFAULT_WORKERS}, max: {MAX_WORKERS})",
+    )
+    parser.add_argument(
+        "--no-threading",
+        action="store_true",
+        help="Disable multi-threading, use single-threaded mode",
+    )
 
     args = parser.parse_args()
 
-    # Create downloader
-    downloader = FiveMinuteKlineDownloader()
+    # Create downloader with specified number of workers
+    downloader = FiveMinuteKlineDownloader(num_workers=args.workers)
 
     if args.status:
         downloader.show_status()
@@ -640,6 +1010,9 @@ Examples:
 
     # Determine resume mode
     resume = args.resume and not args.no_resume
+
+    # Determine threading mode
+    use_threading = not args.no_threading
 
     # Run download
     downloader.download_all(
@@ -649,6 +1022,7 @@ Examples:
         retry_failed=args.retry_failed,
         start_date=args.start_date,
         end_date=args.end_date,
+        use_threading=use_threading,
     )
 
 
