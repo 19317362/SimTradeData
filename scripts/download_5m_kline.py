@@ -185,6 +185,10 @@ class FiveMinuteKlineDownloader:
                             logger.info(f"Detected completed_end_date from H5: {detected_date}")
                         else:
                             progress["completed_end_date"] = None
+                    # Migrate: add uptodate tracking fields if missing
+                    if "uptodate_check_date" not in progress:
+                        progress["uptodate_check_date"] = None
+                        progress["uptodate_stocks"] = []
                     return progress
             except Exception as e:
                 logger.error(f"Error loading progress file: {e}")
@@ -201,6 +205,8 @@ class FiveMinuteKlineDownloader:
             "failed_stocks": [],
             "api_calls_today": 0,
             "api_calls_date": None,
+            "uptodate_check_date": None,  # Date when uptodate_stocks was last checked
+            "uptodate_stocks": [],  # Stocks confirmed up-to-date on check_date
         }
 
     def _save_progress(self) -> None:
@@ -220,7 +226,7 @@ class FiveMinuteKlineDownloader:
         symbol: str,
         start_date: str,
         end_date: str,
-    ) -> bool:
+    ) -> str:
         """
         Download 5-minute K-line data for a single stock
 
@@ -230,7 +236,7 @@ class FiveMinuteKlineDownloader:
             end_date: End date (YYYY-MM-DD)
 
         Returns:
-            True if successful, False otherwise
+            "success" if data downloaded, "no_data" if no new data, "failed" if error
         """
         try:
             # Fetch data
@@ -240,19 +246,19 @@ class FiveMinuteKlineDownloader:
             self.api_counter.increment()
 
             if df.empty:
-                logger.warning(f"No 5m data for {symbol}")
-                return True  # Consider empty result as "success" (no data available)
+                logger.info(f"No new 5m data for {symbol} ({start_date} ~ {end_date})")
+                return "no_data"  # No new data available for this date range
 
             # Write to HDF5
             self.writer.write_5m_kline_data(symbol, df, mode="a")
 
             logger.info(f"Downloaded 5m data for {symbol}: {len(df)} rows")
-            return True
+            return "success"
 
         except Exception as e:
             logger.error(f"Failed to download {symbol}: {e}")
             self.session_failed.append(symbol)
-            return False
+            return "failed"
 
     def get_stock_pool(self, end_date: str) -> list:
         """
@@ -379,13 +385,25 @@ class FiveMinuteKlineDownloader:
                 stocks_to_process = stocks_to_process[:max_stocks]
                 print(f"Limited to {max_stocks} stocks this session")
 
+            # Handle uptodate_stocks tracking (stocks checked today with no new data)
+            today = datetime.now().strftime("%Y-%m-%d")
+            uptodate_check_date = self.progress.get("uptodate_check_date")
+            if uptodate_check_date != today:
+                # New day - reset uptodate_stocks list
+                self.progress["uptodate_check_date"] = today
+                self.progress["uptodate_stocks"] = []
+                logger.info(f"New check date {today}, reset uptodate_stocks list")
+            uptodate_stocks = set(self.progress.get("uptodate_stocks", []))
+
             # Download loop - check each stock's actual max date
             new_downloads = 0
             incremental_updates = 0
             skipped_uptodate = 0
+            skipped_checked_today = 0
             failed_count = 0
 
             print(f"\nTotal stocks to process: {len(stocks_to_process)}")
+            print(f"Stocks already checked today (no new data): {len(uptodate_stocks)}")
             print(f"API calls remaining: {self.api_counter.get_remaining(api_threshold)}")
             print()
 
@@ -394,6 +412,11 @@ class FiveMinuteKlineDownloader:
                 if not self.api_counter.check_limit(api_threshold):
                     print(f"\n\nAPI limit reached ({api_threshold}). Saving progress...")
                     break
+
+                # Skip stocks already checked today with no new data
+                if symbol in uptodate_stocks:
+                    skipped_checked_today += 1
+                    continue
 
                 # Check stock's actual max date in H5 file
                 stock_max_date = self.writer.get_5m_stock_max_date(symbol)
@@ -412,25 +435,37 @@ class FiveMinuteKlineDownloader:
                             + pd.Timedelta(days=1)
                         ).strftime("%Y-%m-%d")
 
-                        if self.download_stock_5m_data(symbol, download_start, end_date):
+                        result = self.download_stock_5m_data(symbol, download_start, end_date)
+                        if result == "success":
                             incremental_updates += 1
                             if symbol not in self.progress["completed_stocks"]:
                                 self.progress["completed_stocks"].append(symbol)
                             if symbol in self.progress["failed_stocks"]:
                                 self.progress["failed_stocks"].remove(symbol)
-                        else:
+                        elif result == "no_data":
+                            # No new data available - mark as checked today
+                            self.progress["uptodate_stocks"].append(symbol)
+                            uptodate_stocks.add(symbol)
+                            if symbol not in self.progress["completed_stocks"]:
+                                self.progress["completed_stocks"].append(symbol)
+                        else:  # failed
                             failed_count += 1
                             if symbol not in self.progress["failed_stocks"]:
                                 self.progress["failed_stocks"].append(symbol)
                 else:
                     # Stock not in H5, need full download
-                    if self.download_stock_5m_data(symbol, start_date, end_date):
+                    result = self.download_stock_5m_data(symbol, start_date, end_date)
+                    if result == "success":
                         new_downloads += 1
                         if symbol not in self.progress["completed_stocks"]:
                             self.progress["completed_stocks"].append(symbol)
                         if symbol in self.progress["failed_stocks"]:
                             self.progress["failed_stocks"].remove(symbol)
-                    else:
+                    elif result == "no_data":
+                        # No data available for this stock - mark as checked today
+                        self.progress["uptodate_stocks"].append(symbol)
+                        uptodate_stocks.add(symbol)
+                    else:  # failed
                         failed_count += 1
                         if symbol not in self.progress["failed_stocks"]:
                             self.progress["failed_stocks"].append(symbol)
@@ -455,10 +490,12 @@ class FiveMinuteKlineDownloader:
             print(f"This session:")
             print(f"  New stocks downloaded: {new_downloads}")
             print(f"  Incremental updates: {incremental_updates}")
-            print(f"  Skipped (up to date): {skipped_uptodate}")
+            print(f"  Skipped (up to date in H5): {skipped_uptodate}")
+            print(f"  Skipped (checked today, no new data): {skipped_checked_today}")
             print(f"  Failed: {failed_count}")
             print(f"Total progress: {len(self.progress['completed_stocks'])}/{self.progress['total_stocks']}")
             print(f"Failed stocks: {len(self.progress['failed_stocks'])}")
+            print(f"Stocks checked today (no new data): {len(self.progress.get('uptodate_stocks', []))}")
             print(f"Data range completed: {self.progress.get('completed_end_date', 'N/A')}")
             print(f"API calls used: {self.api_counter.calls_today}")
 
@@ -472,6 +509,7 @@ class FiveMinuteKlineDownloader:
                 "new_downloads": new_downloads,
                 "incremental_updates": incremental_updates,
                 "skipped_uptodate": skipped_uptodate,
+                "skipped_checked_today": skipped_checked_today,
                 "failed": failed_count,
                 "total_completed": len(self.progress["completed_stocks"]),
                 "total_stocks": self.progress["total_stocks"],
@@ -497,6 +535,11 @@ class FiveMinuteKlineDownloader:
         print(f"Completed: {len(progress.get('completed_stocks', []))}")
         print(f"Failed: {len(progress.get('failed_stocks', []))}")
         print(f"Remaining: {progress.get('total_stocks', 0) - len(progress.get('completed_stocks', []))}")
+        print()
+        uptodate_check_date = progress.get("uptodate_check_date", "N/A")
+        uptodate_count = len(progress.get("uptodate_stocks", []))
+        print(f"Uptodate check date: {uptodate_check_date}")
+        print(f"Stocks checked (no new data): {uptodate_count}")
         print()
 
         # API counter status
