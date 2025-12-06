@@ -571,9 +571,21 @@ class HDF5Writer:
         key = f"stock_data/{symbol}"
 
         with pd.HDFStore(self.ptrade_data_5m_path, mode=mode) as store:
+            # Check if key exists and merge with existing data
+            if key in store:
+                existing_data = store[key]
+                # Combine existing and new data, remove duplicates
+                combined = pd.concat([existing_data, data])
+                combined = combined[~combined.index.duplicated(keep='last')]
+                combined = combined.sort_index()
+                final_data = combined
+                logger.debug(f"Merged 5m data for {symbol}: {len(existing_data)} + {len(data)} -> {len(final_data)}")
+            else:
+                final_data = data
+
             store.put(
                 key,
-                data,
+                final_data,
                 format="table",
                 complevel=9,
                 complib="blosc",
@@ -581,7 +593,7 @@ class HDF5Writer:
 
         logger.info(
             f"Wrote 5m kline for {symbol} to {self.ptrade_data_5m_path}: "
-            f"{len(data)} rows"
+            f"{len(final_data)} rows"
         )
 
     def get_existing_5m_stocks(self) -> List[str]:
@@ -605,3 +617,71 @@ class HDF5Writer:
         except Exception as e:
             logger.error(f"Error reading 5m stocks from {self.ptrade_data_5m_path}: {e}")
             return []
+
+    def get_5m_max_date(self, sample_size: int = 10) -> str | None:
+        """
+        Get the maximum date in 5-minute HDF5 file by sampling stocks
+
+        Args:
+            sample_size: Number of stocks to sample for date detection
+
+        Returns:
+            Maximum date string (YYYY-MM-DD) or None if file is empty
+        """
+        if not self.ptrade_data_5m_path.exists():
+            return None
+
+        try:
+            with pd.HDFStore(self.ptrade_data_5m_path, mode="r") as store:
+                keys = [k for k in store.keys() if k.startswith("/stock_data/")]
+                if not keys:
+                    return None
+
+                # Sample a few stocks to find max date
+                import random
+                sample_keys = random.sample(keys, min(sample_size, len(keys)))
+
+                max_date = None
+                for key in sample_keys:
+                    try:
+                        df = store[key]
+                        if not df.empty:
+                            stock_max = df.index.max()
+                            if max_date is None or stock_max > max_date:
+                                max_date = stock_max
+                    except Exception:
+                        continue
+
+                if max_date is not None:
+                    return max_date.strftime("%Y-%m-%d")
+                return None
+        except Exception as e:
+            logger.error(f"Error reading 5m max date from {self.ptrade_data_5m_path}: {e}")
+            return None
+
+    def get_5m_stock_max_date(self, symbol: str) -> str | None:
+        """
+        Get the maximum date for a specific stock in 5-minute HDF5 file
+
+        Args:
+            symbol: Stock code in PTrade format (e.g., '000001.SZ')
+
+        Returns:
+            Maximum date string (YYYY-MM-DD) or None if stock not found
+        """
+        if not self.ptrade_data_5m_path.exists():
+            return None
+
+        key = f"/stock_data/{symbol}"
+
+        try:
+            with pd.HDFStore(self.ptrade_data_5m_path, mode="r") as store:
+                if key not in store:
+                    return None
+                df = store[key]
+                if df.empty:
+                    return None
+                return df.index.max().strftime("%Y-%m-%d")
+        except Exception as e:
+            logger.error(f"Error reading 5m max date for {symbol}: {e}")
+            return None

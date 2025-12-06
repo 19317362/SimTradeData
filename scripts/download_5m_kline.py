@@ -176,15 +176,25 @@ class FiveMinuteKlineDownloader:
                 with open(self.progress_file, "r", encoding="utf-8") as f:
                     progress = json.load(f)
                     logger.info(f"Loaded progress: {len(progress.get('completed_stocks', []))} completed")
+                    # Migrate old progress files without completed_end_date
+                    if "completed_end_date" not in progress or progress["completed_end_date"] is None:
+                        # Try to detect from H5 file
+                        detected_date = self.writer.get_5m_max_date(sample_size=20)
+                        if detected_date:
+                            progress["completed_end_date"] = detected_date
+                            logger.info(f"Detected completed_end_date from H5: {detected_date}")
+                        else:
+                            progress["completed_end_date"] = None
                     return progress
             except Exception as e:
                 logger.error(f"Error loading progress file: {e}")
 
         # Default progress structure
         return {
-            "version": 1,
+            "version": 2,
             "start_date": KLINE_5M_START_DATE,
             "end_date": datetime.now().strftime("%Y-%m-%d"),
+            "completed_end_date": None,  # Actual end date when stocks were completed
             "last_update": None,
             "total_stocks": 0,
             "completed_stocks": [],
@@ -346,57 +356,94 @@ class FiveMinuteKlineDownloader:
 
             if retry_failed:
                 # Only retry failed stocks
-                need_download = sorted(list(failed))
-                print(f"\nRetrying {len(need_download)} failed stocks...")
+                stocks_to_process = sorted(list(failed))
+                print(f"\nRetrying {len(stocks_to_process)} failed stocks...")
             elif resume:
-                # Skip completed stocks
-                need_download = [s for s in stock_pool if s not in completed]
-                print(f"\nResume mode: {len(completed)} completed, {len(need_download)} remaining")
+                # Process all stocks (check each one's actual max date)
+                stocks_to_process = stock_pool
+                print(f"\nResume mode: will check each stock's actual data range")
+                print(f"  Previously marked completed: {len(completed)}")
+                print(f"  Previously marked failed: {len(failed)}")
             else:
                 # Full download (ignore previous progress)
-                need_download = stock_pool
-                print(f"\nFull download mode: {len(need_download)} stocks")
+                stocks_to_process = stock_pool
+                self.progress["completed_stocks"] = []  # Reset
+                print(f"\nFull download mode: {len(stocks_to_process)} stocks")
 
-            if not need_download:
-                print("\nAll stocks already downloaded!")
-                return {"success": 0, "failed": 0, "skipped": len(completed)}
+            if not stocks_to_process:
+                print("\nNo stocks to process!")
+                return {"success": 0, "failed": 0, "skipped": 0}
 
             # Apply max_stocks limit
-            if max_stocks and len(need_download) > max_stocks:
-                need_download = need_download[:max_stocks]
+            if max_stocks and len(stocks_to_process) > max_stocks:
+                stocks_to_process = stocks_to_process[:max_stocks]
                 print(f"Limited to {max_stocks} stocks this session")
 
-            # Download loop
-            success = 0
+            # Download loop - check each stock's actual max date
+            new_downloads = 0
+            incremental_updates = 0
+            skipped_uptodate = 0
             failed_count = 0
-            skipped = len(completed)
 
-            print(f"\nDownloading {len(need_download)} stocks...")
+            print(f"\nTotal stocks to process: {len(stocks_to_process)}")
             print(f"API calls remaining: {self.api_counter.get_remaining(api_threshold)}")
             print()
 
-            for i, symbol in enumerate(tqdm(need_download, desc="Downloading")):
+            for i, symbol in enumerate(tqdm(stocks_to_process, desc="Processing")):
                 # Check API limit
                 if not self.api_counter.check_limit(api_threshold):
                     print(f"\n\nAPI limit reached ({api_threshold}). Saving progress...")
                     break
 
-                # Download stock data
-                if self.download_stock_5m_data(symbol, start_date, end_date):
-                    success += 1
-                    self.progress["completed_stocks"].append(symbol)
+                # Check stock's actual max date in H5 file
+                stock_max_date = self.writer.get_5m_stock_max_date(symbol)
 
-                    # Remove from failed list if previously failed
-                    if symbol in self.progress["failed_stocks"]:
-                        self.progress["failed_stocks"].remove(symbol)
+                if stock_max_date:
+                    if stock_max_date >= end_date:
+                        # Stock is already up to date
+                        skipped_uptodate += 1
+                        if symbol not in self.progress["completed_stocks"]:
+                            self.progress["completed_stocks"].append(symbol)
+                        continue
+                    else:
+                        # Need incremental download
+                        download_start = (
+                            datetime.strptime(stock_max_date, "%Y-%m-%d")
+                            + pd.Timedelta(days=1)
+                        ).strftime("%Y-%m-%d")
+
+                        if self.download_stock_5m_data(symbol, download_start, end_date):
+                            incremental_updates += 1
+                            if symbol not in self.progress["completed_stocks"]:
+                                self.progress["completed_stocks"].append(symbol)
+                            if symbol in self.progress["failed_stocks"]:
+                                self.progress["failed_stocks"].remove(symbol)
+                        else:
+                            failed_count += 1
+                            if symbol not in self.progress["failed_stocks"]:
+                                self.progress["failed_stocks"].append(symbol)
                 else:
-                    failed_count += 1
-                    if symbol not in self.progress["failed_stocks"]:
-                        self.progress["failed_stocks"].append(symbol)
+                    # Stock not in H5, need full download
+                    if self.download_stock_5m_data(symbol, start_date, end_date):
+                        new_downloads += 1
+                        if symbol not in self.progress["completed_stocks"]:
+                            self.progress["completed_stocks"].append(symbol)
+                        if symbol in self.progress["failed_stocks"]:
+                            self.progress["failed_stocks"].remove(symbol)
+                    else:
+                        failed_count += 1
+                        if symbol not in self.progress["failed_stocks"]:
+                            self.progress["failed_stocks"].append(symbol)
 
                 # Save progress periodically
                 if (i + 1) % BATCH_SIZE == 0:
                     self._save_progress()
+
+            # Update completed_end_date if all stocks are now up to date
+            total_processed = new_downloads + incremental_updates + skipped_uptodate
+            if total_processed == len(stocks_to_process) and failed_count == 0:
+                self.progress["completed_end_date"] = end_date
+                logger.info(f"Updated completed_end_date to {end_date}")
 
             # Final progress save
             self._save_progress()
@@ -405,9 +452,14 @@ class FiveMinuteKlineDownloader:
             print("\n" + "=" * 70)
             print("Download Complete!")
             print("=" * 70)
-            print(f"This session: {success} success, {failed_count} failed")
+            print(f"This session:")
+            print(f"  New stocks downloaded: {new_downloads}")
+            print(f"  Incremental updates: {incremental_updates}")
+            print(f"  Skipped (up to date): {skipped_uptodate}")
+            print(f"  Failed: {failed_count}")
             print(f"Total progress: {len(self.progress['completed_stocks'])}/{self.progress['total_stocks']}")
             print(f"Failed stocks: {len(self.progress['failed_stocks'])}")
+            print(f"Data range completed: {self.progress.get('completed_end_date', 'N/A')}")
             print(f"API calls used: {self.api_counter.calls_today}")
 
             # File size
@@ -417,9 +469,10 @@ class FiveMinuteKlineDownloader:
                 print(f"File size: {size_mb:.1f} MB")
 
             return {
-                "success": success,
+                "new_downloads": new_downloads,
+                "incremental_updates": incremental_updates,
+                "skipped_uptodate": skipped_uptodate,
                 "failed": failed_count,
-                "skipped": skipped,
                 "total_completed": len(self.progress["completed_stocks"]),
                 "total_stocks": self.progress["total_stocks"],
             }
@@ -437,7 +490,8 @@ class FiveMinuteKlineDownloader:
 
         print(f"Progress file: {self.progress_file}")
         print(f"Last update: {progress.get('last_update', 'N/A')}")
-        print(f"Date range: {progress.get('start_date')} ~ {progress.get('end_date')}")
+        print(f"Target date range: {progress.get('start_date')} ~ {progress.get('end_date')}")
+        print(f"Completed end date: {progress.get('completed_end_date', 'N/A')}")
         print()
         print(f"Total stocks: {progress.get('total_stocks', 0)}")
         print(f"Completed: {len(progress.get('completed_stocks', []))}")
