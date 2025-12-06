@@ -71,8 +71,11 @@ SAFE_API_THRESHOLD = 90000  # Stop before hitting limit
 BATCH_SIZE = 50  # Stocks per batch for progress saving
 
 # Thread configuration
-DEFAULT_WORKERS = 4  # Default number of worker threads
-MAX_WORKERS = 16  # Maximum worker threads allowed
+DEFAULT_WORKERS = 1  # Fixed to 1 due to server-side rate limiting
+MAX_WORKERS = 1  # Fixed to 1 due to server-side rate limiting
+
+# Check and fill configuration
+DEFAULT_TARGET_DATE = "2025-03-10"  # Default target date for --check-and-fill
 
 # Ensure data directory exists before logging setup
 Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
@@ -870,6 +873,156 @@ class FiveMinuteKlineDownloader:
         finally:
             self.fetcher.logout()
 
+    def check_outdated_stocks(self, target_date: str) -> list:
+        """
+        Check which stocks in H5 file have data not updated to target date
+
+        Args:
+            target_date: Target date (YYYY-MM-DD), stocks with max_date < target_date are outdated
+
+        Returns:
+            List of (symbol, max_date) tuples for outdated stocks
+        """
+        print("=" * 70)
+        print(f"Checking stocks with data before {target_date}")
+        print("=" * 70)
+
+        existing_stocks = self.writer.get_existing_5m_stocks()
+        if not existing_stocks:
+            print("No stocks found in H5 file")
+            return []
+
+        print(f"Total stocks in H5 file: {len(existing_stocks)}")
+
+        outdated_stocks = []
+        for symbol in tqdm(existing_stocks, desc="Checking stocks"):
+            max_date = self.writer.get_5m_stock_max_date(symbol)
+            if max_date and max_date < target_date:
+                outdated_stocks.append((symbol, max_date))
+
+        # Sort by max_date
+        outdated_stocks.sort(key=lambda x: x[1])
+
+        print(f"\nOutdated stocks (data before {target_date}): {len(outdated_stocks)}")
+        return outdated_stocks
+
+    def check_and_fill(
+        self,
+        target_date: str = DEFAULT_TARGET_DATE,
+        max_stocks: int = None,
+        max_api_calls: int = None,
+    ) -> dict:
+        """
+        Check which stocks are outdated and fill them with new data
+
+        Args:
+            target_date: Target date to update to (YYYY-MM-DD)
+            max_stocks: Maximum stocks to process this session
+            max_api_calls: Maximum API calls this session
+
+        Returns:
+            Summary dict with statistics
+        """
+        # Check outdated stocks first
+        outdated_stocks = self.check_outdated_stocks(target_date)
+
+        if not outdated_stocks:
+            print("\nAll stocks are up to date!")
+            return {"outdated": 0, "updated": 0, "failed": 0}
+
+        # Print outdated stocks list
+        print("\n" + "=" * 70)
+        print("Outdated stocks list:")
+        print("=" * 70)
+        for symbol, max_date in outdated_stocks[:50]:  # Show first 50
+            print(f"  {symbol}: last data {max_date}")
+        if len(outdated_stocks) > 50:
+            print(f"  ... and {len(outdated_stocks) - 50} more")
+
+        # Apply max_stocks limit
+        stocks_to_process = [s[0] for s in outdated_stocks]
+        if max_stocks and len(stocks_to_process) > max_stocks:
+            stocks_to_process = stocks_to_process[:max_stocks]
+            print(f"\nLimited to {max_stocks} stocks this session")
+
+        # Set API call limit
+        api_threshold = max_api_calls or SAFE_API_THRESHOLD
+
+        print("\n" + "=" * 70)
+        print("Starting to fill outdated stocks")
+        print("=" * 70)
+        print(f"Stocks to process: {len(stocks_to_process)}")
+        print(f"Target date: {target_date}")
+        print(f"API call limit: {api_threshold}")
+        print("=" * 70)
+
+        # Login to BaoStock
+        self.fetcher.login()
+
+        try:
+            # Download statistics
+            updated_count = 0
+            failed_count = 0
+            no_data_count = 0
+
+            # Single-threaded download (workers fixed to 1)
+            for symbol in tqdm(stocks_to_process, desc="Filling data"):
+                # Check API limit
+                if not self.api_counter.check_limit(api_threshold):
+                    print(f"\n\nAPI limit reached ({api_threshold}). Stopping...")
+                    break
+
+                # Get stock's current max date
+                stock_max_date = self.writer.get_5m_stock_max_date(symbol)
+                if not stock_max_date:
+                    # Shouldn't happen, but handle it
+                    failed_count += 1
+                    continue
+
+                # Calculate start date for download
+                download_start = (
+                    datetime.strptime(stock_max_date, "%Y-%m-%d")
+                    + pd.Timedelta(days=1)
+                ).strftime("%Y-%m-%d")
+
+                # Download data
+                result_code, df = self.download_stock_5m_data(
+                    symbol, download_start, target_date
+                )
+
+                if result_code == "success":
+                    self.writer.write_5m_kline_data(symbol, df, mode="a")
+                    updated_count += 1
+                    logger.info(f"Updated {symbol}: {len(df)} rows")
+                elif result_code == "no_data":
+                    no_data_count += 1
+                    logger.info(f"No new data for {symbol}")
+                else:
+                    failed_count += 1
+                    logger.error(f"Failed to update {symbol}")
+
+            # Summary
+            print("\n" + "=" * 70)
+            print("Check and Fill Complete!")
+            print("=" * 70)
+            print(f"Total outdated stocks: {len(outdated_stocks)}")
+            print(f"Processed this session: {len(stocks_to_process)}")
+            print(f"Successfully updated: {updated_count}")
+            print(f"No new data available: {no_data_count}")
+            print(f"Failed: {failed_count}")
+            print(f"API calls used: {self.api_counter.calls_today}")
+
+            return {
+                "outdated": len(outdated_stocks),
+                "processed": len(stocks_to_process),
+                "updated": updated_count,
+                "no_data": no_data_count,
+                "failed": failed_count,
+            }
+
+        finally:
+            self.fetcher.logout()
+
     def show_status(self) -> None:
         """Display current download progress"""
         print("=" * 70)
@@ -916,16 +1069,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Download 5-minute K-line data from BaoStock",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
 Examples:
-  # First run with multi-threading (default: 4 workers)
+  # Normal download (single-threaded due to server rate limiting)
   python download_5m_kline.py
-
-  # Use 8 worker threads for faster download
-  python download_5m_kline.py --workers 8
-
-  # Single-threaded mode (for debugging)
-  python download_5m_kline.py --no-threading
 
   # Continue from last progress
   python download_5m_kline.py --resume
@@ -938,6 +1085,15 @@ Examples:
 
   # Check progress
   python download_5m_kline.py --status
+
+  # Check and fill outdated stocks (default target: {DEFAULT_TARGET_DATE})
+  python download_5m_kline.py --check-and-fill
+
+  # Check and fill with custom target date
+  python download_5m_kline.py --check-and-fill --target-date 2025-03-15
+
+  # Only check outdated stocks without filling
+  python download_5m_kline.py --check-only
         """,
     )
 
@@ -996,23 +1152,57 @@ Examples:
     parser.add_argument(
         "--no-threading",
         action="store_true",
-        help="Disable multi-threading, use single-threaded mode",
+        help="Disable multi-threading, use single-threaded mode (deprecated: workers fixed to 1)",
+    )
+    parser.add_argument(
+        "--check-and-fill",
+        action="store_true",
+        help=f"Check outdated stocks in H5 file and fill them to target date (default: {DEFAULT_TARGET_DATE})",
+    )
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Only check outdated stocks without filling (use with --target-date)",
+    )
+    parser.add_argument(
+        "--target-date",
+        type=str,
+        metavar="DATE",
+        default=DEFAULT_TARGET_DATE,
+        help=f"Target date for --check-and-fill or --check-only (YYYY-MM-DD, default: {DEFAULT_TARGET_DATE})",
     )
 
     args = parser.parse_args()
 
-    # Create downloader with specified number of workers
-    downloader = FiveMinuteKlineDownloader(num_workers=args.workers)
+    # Workers fixed to 1 due to server rate limiting (ignore user input)
+    num_workers = 1
+
+    # Create downloader with fixed single worker
+    downloader = FiveMinuteKlineDownloader(num_workers=num_workers)
 
     if args.status:
         downloader.show_status()
         return
 
+    # Handle check-only mode
+    if args.check_only:
+        downloader.check_outdated_stocks(args.target_date)
+        return
+
+    # Handle check-and-fill mode
+    if args.check_and_fill:
+        downloader.check_and_fill(
+            target_date=args.target_date,
+            max_stocks=args.max_stocks,
+            max_api_calls=args.max_api_calls,
+        )
+        return
+
     # Determine resume mode
     resume = args.resume and not args.no_resume
 
-    # Determine threading mode
-    use_threading = not args.no_threading
+    # Threading is always disabled (workers fixed to 1)
+    use_threading = False
 
     # Run download
     downloader.download_all(
