@@ -24,6 +24,7 @@ if str(project_root) not in sys.path:
 
 import json
 import logging
+import time
 import warnings
 from datetime import datetime, date
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -76,6 +77,7 @@ MAX_WORKERS = 1  # Fixed to 1 due to server-side rate limiting
 
 # Check and fill configuration
 DEFAULT_TARGET_DATE = "2025-03-10"  # Default target date for --check-and-fill
+DEFAULT_LOOP_INTERVAL = 60  # Default interval between loop iterations (seconds)
 
 # Ensure data directory exists before logging setup
 Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
@@ -1092,6 +1094,12 @@ Examples:
   # Check and fill with custom target date
   python download_5m_kline.py --check-and-fill --target-date 2025-03-15
 
+  # Auto-loop until all stocks are updated (with default 60s interval)
+  python download_5m_kline.py --check-and-fill --loop
+
+  # Auto-loop with custom interval (120 seconds between iterations)
+  python download_5m_kline.py --check-and-fill --loop --loop-interval 120
+
   # Only check outdated stocks without filling
   python download_5m_kline.py --check-only
         """,
@@ -1171,6 +1179,18 @@ Examples:
         default=DEFAULT_TARGET_DATE,
         help=f"Target date for --check-and-fill or --check-only (YYYY-MM-DD, default: {DEFAULT_TARGET_DATE})",
     )
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help="Enable auto-loop mode: automatically retry until all stocks are updated",
+    )
+    parser.add_argument(
+        "--loop-interval",
+        type=int,
+        metavar="SECONDS",
+        default=DEFAULT_LOOP_INTERVAL,
+        help=f"Interval between loop iterations in seconds (default: {DEFAULT_LOOP_INTERVAL})",
+    )
 
     args = parser.parse_args()
 
@@ -1191,11 +1211,53 @@ Examples:
 
     # Handle check-and-fill mode
     if args.check_and_fill:
-        downloader.check_and_fill(
-            target_date=args.target_date,
-            max_stocks=args.max_stocks,
-            max_api_calls=args.max_api_calls,
-        )
+        if args.loop:
+            # Loop mode: keep running until all stocks are updated
+            iteration = 0
+            while True:
+                iteration += 1
+                print(f"\n{'='*70}")
+                print(f"Loop iteration #{iteration}")
+                print(f"{'='*70}")
+
+                result = downloader.check_and_fill(
+                    target_date=args.target_date,
+                    max_stocks=args.max_stocks,
+                    max_api_calls=args.max_api_calls,
+                )
+
+                # Check if all stocks are up to date
+                if result["outdated"] == 0:
+                    print(f"\n{'='*70}")
+                    print("All stocks are up to date! Loop completed.")
+                    print(f"Total iterations: {iteration}")
+                    print(f"{'='*70}")
+                    break
+
+                # Check if we made progress this iteration
+                if result["updated"] == 0 and result["failed"] == 0:
+                    print(f"\nNo progress made this iteration (no updates, no failures).")
+                    print("This might indicate no new data available or API issues.")
+                    print(f"Waiting {args.loop_interval} seconds before retry...")
+
+                # Wait before next iteration
+                print(f"\nWaiting {args.loop_interval} seconds before next iteration...")
+                print("(Press Ctrl+C to stop)")
+                try:
+                    time.sleep(args.loop_interval)
+                except KeyboardInterrupt:
+                    print(f"\n\nLoop interrupted by user after {iteration} iterations.")
+                    break
+
+                # Recreate downloader to reset API counter for new day
+                downloader = FiveMinuteKlineDownloader(num_workers=num_workers)
+        else:
+            # Single run mode
+            downloader.check_and_fill(
+                target_date=args.target_date,
+                max_stocks=args.max_stocks,
+                max_api_calls=args.max_api_calls,
+            )
         return
 
     # Determine resume mode
